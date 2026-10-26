@@ -1,0 +1,4 @@
+asset_id,criticality,cve
+workstation-01,medium,CVE-2099-99999
+web-server-01,high,CVE-2021-44228
+identity-server-01,critical,CVE-2021-44228

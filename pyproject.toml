@@ -1,0 +1,6 @@
+[project]
+name = "vulnops"
+version = "0.1.0"
+description = "An explainable remediation queue using CISA KEV and three deterministic rules."
+requires-python = ">=3.10"
+dependencies = []
