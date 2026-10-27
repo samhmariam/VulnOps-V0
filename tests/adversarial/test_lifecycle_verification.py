@@ -60,6 +60,8 @@ def test_only_resolved_with_passed_verification_leaves_the_active_queue():
         root = Path(directory)
         (root / "data").mkdir()
         (root / "state").mkdir()
+        (root / "data" / "verification_scan.json").write_text(json.dumps({
+            "status": "succeeded", "covered_asset_ids": [case[0] for case in cases]}))
         scanner_path = root / "data" / "mock_scanner_output.json"
         scanner_path.write_text(json.dumps({"value": [
             {"machineId": f"machine-{asset}", "cveId": cve, "severity": "Critical"}

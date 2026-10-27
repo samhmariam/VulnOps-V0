@@ -36,6 +36,8 @@ class VulnOpsTests(unittest.TestCase):
                 root = Path(directory)
                 (root / "data").mkdir()
                 (root / "state").mkdir()
+                (root / "data" / "verification_scan.json").write_text(json.dumps({
+                    "status": "succeeded", "covered_asset_ids": ["payments-api-01", "hr-app-01"]}))
                 (root / "output").mkdir()
                 scanner_path = root / "data" / "mock_scanner_output.json"
                 scanner_path.write_text(json.dumps({"value": observations}))
@@ -93,6 +95,8 @@ class VulnOpsTests(unittest.TestCase):
             root = Path(directory)
             (root / "data").mkdir()
             (root / "state").mkdir()
+            (root / "data" / "verification_scan.json").write_text(json.dumps({
+                "status": "succeeded", "covered_asset_ids": ["payments-api-01", "hr-app-01", "legacy-db-01"]}))
             for filename in ("mock_scanner_output.json", "asset_context.csv"):
                 (root / "data" / filename).write_bytes((project_root / "data" / filename).read_bytes())
             (root / "state" / "remediation_status.csv").write_text(
@@ -177,6 +181,8 @@ class VulnOpsTests(unittest.TestCase):
             root = Path(directory)
             (root / "data").mkdir()
             (root / "state").mkdir()
+            (root / "data" / "verification_scan.json").write_text(json.dumps({
+                "status": "succeeded", "covered_asset_ids": ["payments-api-01"]}))
             context_path = root / "data" / "asset_context.csv"
             scanner_path = root / "data" / "mock_scanner_output.json"
             state_path = root / "state" / "remediation_status.csv"
@@ -336,6 +342,8 @@ class VulnOpsTests(unittest.TestCase):
             root = Path(directory)
             (root / "data").mkdir()
             (root / "state").mkdir()
+            (root / "data" / "verification_scan.json").write_text(json.dumps({
+                "status": "succeeded", "covered_asset_ids": ["payments-api-01", *[peer["asset_id"] for peer in peers]]}))
             fixture = root / "data" / "finding_fixture.csv"
             with fixture.open("w", newline="") as output:
                 writer = csv.DictWriter(output, fieldnames=list(scanner_finding))
@@ -428,6 +436,8 @@ class VulnOpsTests(unittest.TestCase):
     def run_fixture_main(self):
         """Supply deterministic findings at the acquisition boundary for policy regressions."""
         findings = self.read_fixture_findings(vulnops.ROOT / "data" / "finding_fixture.csv")
+        (vulnops.ROOT / "data" / "verification_scan.json").write_text(json.dumps({
+            "status": "succeeded", "covered_asset_ids": sorted({row["asset_id"] for row in findings})}))
         with patch("vulnops.load_asset_context", return_value={}):
             with patch("vulnops.load_scanner_output", return_value=[]):
                 with patch("vulnops.build_findings", return_value=findings):

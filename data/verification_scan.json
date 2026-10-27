@@ -1,0 +1,7 @@
+{
+  "status": "succeeded",
+  "covered_asset_ids": [
+    "payments-api-01",
+    "hr-app-01"
+  ]
+}

@@ -1,10 +1,10 @@
-# VulnOps V0.8
+# VulnOps V0.9
 
-One Python script, no external dependencies: combine mock scanner observations with local context, apply verification-backed closure, classify active findings, rank P2, and write one remediation CSV. V0.8 changes the observation source, not the control policy.
+One Python script, no external dependencies: combine mock scanner observations with local context, apply verification-backed closure, classify active findings, rank P2, and write one remediation CSV. V0.9 adds qualified remediation verification: evidence is accepted only from a successful scan that explicitly covers the asset. Classification and ranking policies are unchanged.
 
 Before V0.8, `findings.csv` already supplied a fully formed VulnOps finding, mixing technical observations with business context. V0.8 separates those sources: scanner-shaped observations + local asset context → VulnOps finding → existing control plane.
 
-V0.8 does NOT connect to a live scanner. V0.8 does NOT require Microsoft Defender credentials. V0.8 does NOT implement authentication. The mock data exists specifically to prove the scanner integration contract before adding a live vendor dependency.
+V0.9 does NOT connect to a live scanner, require Microsoft Defender credentials, or implement authentication. The mock data proves the scanner integration contract without a live vendor dependency.
 
 ## Source split
 
@@ -42,7 +42,7 @@ After joining, the finding contains exactly: `asset_id`, `cve`, `severity`, `ass
             ▼
        lifecycle
             │
-       verification
+ qualified verification
             │
        classification
             │
@@ -72,6 +72,7 @@ python3 vulnops.py
 - Local asset context: `data/asset_context.csv`
 - Local lifecycle state: `state/remediation_status.csv`
 - Local verification evidence: `data/verification_results.csv`
+- Verification scan quality: `data/verification_scan.json`
 - Output: `output/remediation_queue.csv`
 - Paths: relative to `vulnops.py`; output directory created automatically
 
@@ -133,14 +134,41 @@ hr-web-01,CVE-2026-5678,true
 
 Only lowercase `true` and `false` are accepted. `true` means the supplied evidence still observes the vulnerability; `false` means that evidence did not find it present. Absence from an arbitrary findings CSV is not verification evidence.
 
-| Remediation claim | Verification evidence | Derived verification status | Active? |
+`data/verification_scan.json` supplies exactly two fields:
+
+```json
+{
+  "status": "succeeded",
+  "covered_asset_ids": ["payments-api-01", "hr-app-01"]
+}
+```
+
+`status` must be exactly `succeeded` or `failed`. Coverage must be a list of unique, non-empty VulnOps `asset_id` strings; surrounding whitespace is trimmed. An empty list is valid. Missing, extra, or malformed fields fail the run.
+
+### Qualified remediation verification
+
+```text
+remediation claim
+        ↓
+verification result + verification scan quality
+        ↓
+   qualification
+        ↓
+verification_status
+```
+
+`vulnerability_present=false` is no longer sufficient by itself. A supplied result is qualified only when **scan status == succeeded AND asset_id is explicitly covered**. Failed scans qualify no results; uncovered assets qualify no results. This applies to both `true` and `false` presence evidence. Coverage alone does not invent a missing per-CVE result.
+
+Qualification filters evidence without changing its boolean value, the remediation claim, or the finding. The existing verification function then interprets only the claim and qualified evidence:
+
+| Remediation claim | Qualified verification evidence | Derived verification status | Active? |
 | --- | --- | --- | --- |
 | open | Any or none | not_applicable | Yes |
-| resolved | No matching entry | unverified | Yes |
-| resolved | vulnerability_present=true | failed | Yes |
-| resolved | vulnerability_present=false | passed | No |
+| resolved | No qualified evidence | unverified | Yes |
+| resolved | Qualified vulnerability_present=true | failed | Yes |
+| resolved | Qualified vulnerability_present=false | passed | No |
 
-Missing evidence means `unverified`, never `passed` or `failed`. VulnOps preserves claims and evidence: `resolved` + `failed` means remediation was declared complete but verification still observes the vulnerability.
+Missing or disqualified evidence means `unverified` for resolved findings, never `passed` or `failed`. Open findings always remain `not_applicable` and open. VulnOps preserves claims and evidence: `resolved` + `failed` means remediation was declared complete but qualified verification still observes the vulnerability.
 
 ## 2. HOW URGENT IS IT?
 
@@ -189,15 +217,25 @@ owner_team does NOT affect priority. owner_team does NOT affect ranking. unknown
 
 ## 5. WHAT ALLOWS CLOSURE?
 
-A resolved remediation claim **and** passed verification. V0.8 retains the verification-backed closure introduced in V0.7.
+A resolved remediation claim **and** passed verification, derived from qualified evidence. Only `resolved + passed` leaves the active queue; a failed scan or unproven asset coverage cannot authorize closure.
 
 An operator's resolved declaration alone is insufficient evidence for closure.
 
-Verification is only as trustworthy as the supplied verification scan/evidence. V0.8 does not yet validate scanner coverage, freshness, authentication, or provenance.
+V0.9 checks the supplied scan outcome and asset-coverage declaration. It does not independently establish that those declarations are trustworthy. Passing evidence does not guarantee patch success or prevent recurrence; qualification does not change priority, ranking, or ownership.
 
-Scanner identity, signature version, and completeness are also unchecked. Passing evidence does not guarantee patch success or prevent recurrence. V0.8 does not detect reintroduction or rewrite `resolved` to `open`.
+V0.9 does **not** implement:
 
-No tickets, assigned people, SLAs, due dates, acknowledgements, workflow transitions, or patch execution.
+- Timestamps or freshness checks
+- Scan-run IDs
+- Scanner provenance
+- Scanner authentication
+- Historical reconciliation
+- Reappearance detection
+- Live scanner integration
+- SLAs
+- Ticketing
+- Patch automation
+- AI
 
 ## Output
 
@@ -216,7 +254,7 @@ FIRST receives one request for unique active CVEs, limited to 2,000 characters i
 ## Tests
 
 ```sh
-python3 -m unittest discover -s tests -v
+uv run --no-project --with pytest python -m pytest tests -q
 ```
 
-Controlled responses; no credentials or network requests. Tests cover scanner loading, normalization, duplicate/conflicting observations, context joins, missing context, empty input, source equivalence, and the existing classification, ranking, ownership, lifecycle, and verification behaviour.
+Tests use controlled responses, without scanner credentials or network requests; the first command invocation may download pytest. Coverage includes scanner inputs, existing control policies, and V0.9 scan validation, evidence qualification, closure eligibility, and unchanged open-finding behaviour.

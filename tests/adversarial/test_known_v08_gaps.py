@@ -22,6 +22,8 @@ OBSERVATION = {"machineId": "machine-001", "cveId": CVE, "severity": "Critical"}
 def _write_inputs(root, claim, observations, present):
     (root / "data").mkdir()
     (root / "state").mkdir()
+    (root / "data" / "verification_scan.json").write_text(
+        json.dumps({"status": "succeeded", "covered_asset_ids": [ASSET]}), encoding="utf-8")
     (root / "data" / "mock_scanner_output.json").write_text(
         json.dumps({"value": observations}), encoding="utf-8")
     (root / "data" / "asset_context.csv").write_text(

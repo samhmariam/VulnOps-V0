@@ -134,6 +134,29 @@ def load_remediation_statuses(path):
     return statuses
 
 
+def load_verification_scan(path):
+    """Load scan outcome and covered asset IDs without qualifying any findings."""
+    with path.open(encoding="utf-8-sig") as source:
+        payload = json.load(source)
+    if not isinstance(payload, dict) or set(payload) != {"status", "covered_asset_ids"}:
+        raise ValueError("Verification scan must contain exactly status and covered_asset_ids.")
+    if payload["status"] not in ("succeeded", "failed"):
+        raise ValueError("Verification scan status must be succeeded or failed.")
+    if not isinstance(payload["covered_asset_ids"], list):
+        raise ValueError("Verification scan covered_asset_ids must be a list.")
+    covered = []
+    seen = set()
+    for asset_id in payload["covered_asset_ids"]:
+        if not isinstance(asset_id, str) or not asset_id.strip():
+            raise ValueError("Verification scan asset IDs must be non-empty strings.")
+        asset_id = asset_id.strip()
+        if asset_id in seen:
+            raise ValueError(f"Duplicate verification scan asset_id: {asset_id!r}.")
+        seen.add(asset_id)
+        covered.append(asset_id)
+    return {"status": payload["status"], "covered_asset_ids": covered}
+
+
 def load_verification_results(path):
     """Load explicit presence evidence as booleans keyed by (asset_id, cve)."""
     required = ("asset_id", "cve", "vulnerability_present")
@@ -158,6 +181,14 @@ def load_verification_results(path):
                 raise ValueError(f"Duplicate verification result for {key!r} at line {reader.line_num}.")
             results[key] = row["vulnerability_present"] == "true"
     return results
+
+
+def qualify_verification_results(verification_results, verification_scan):
+    """Retain unchanged evidence only for assets covered by a successful scan."""
+    if verification_scan["status"] != "succeeded":
+        return {}
+    covered_asset_ids = set(verification_scan["covered_asset_ids"])
+    return {key: present for key, present in verification_results.items() if key[0] in covered_asset_ids}
 
 
 def apply_remediation_status(findings, statuses):
@@ -298,6 +329,8 @@ def main():
         statuses = load_remediation_statuses(ROOT / "state" / "remediation_status.csv")
         findings = apply_remediation_status(findings, statuses)
         verification_results = load_verification_results(ROOT / "data" / "verification_results.csv")
+        verification_scan = load_verification_scan(ROOT / "data" / "verification_scan.json")
+        verification_results = qualify_verification_results(verification_results, verification_scan)
         findings = apply_verification_status(findings, verification_results)
         findings = [finding for finding in findings
                     if not (finding["remediation_status"] == "resolved" and finding["verification_status"] == "passed")]

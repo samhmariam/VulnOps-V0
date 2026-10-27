@@ -18,6 +18,8 @@ def _run_queue(cases):
         root = Path(directory)
         (root / "data").mkdir()
         (root / "state").mkdir()
+        (root / "data" / "verification_scan.json").write_text(json.dumps({
+            "status": "succeeded", "covered_asset_ids": [case[0] for case in cases]}))
         scanner = []
         context = []
         kev_cves = set()
