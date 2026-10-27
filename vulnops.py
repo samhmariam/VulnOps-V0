@@ -149,6 +149,7 @@ def main():
         results = prioritize(findings, kev_cves)
         p2 = [row for row in results if row["priority"] == "P2"]
         p2.sort(key=lambda row: (
+            {"true": 0, "unknown": 1, "false": 2}[row["internet_exposed"]],
             row["epss_score"] is None,
             -row["epss_score"] if row["epss_score"] is not None else 0,
         ))
