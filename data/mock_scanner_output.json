@@ -1,0 +1,54 @@
+{
+  "value": [
+    {
+      "machineId": "machine-001",
+      "cveId": "CVE-2026-1001",
+      "severity": "Critical"
+    },
+    {
+      "machineId": "machine-001",
+      "cveId": "CVE-2026-1002",
+      "severity": "High"
+    },
+    {
+      "machineId": "machine-001",
+      "cveId": "CVE-2026-1003",
+      "severity": "Medium"
+    },
+    {
+      "machineId": "machine-002",
+      "cveId": "CVE-2026-1001",
+      "severity": "Critical"
+    },
+    {
+      "machineId": "machine-002",
+      "cveId": "CVE-2026-1004",
+      "severity": "Low"
+    },
+    {
+      "machineId": "machine-002",
+      "cveId": "CVE-2026-1005",
+      "severity": "High"
+    },
+    {
+      "machineId": "machine-003",
+      "cveId": "CVE-2026-1002",
+      "severity": "High"
+    },
+    {
+      "machineId": "machine-003",
+      "cveId": "CVE-2026-1006",
+      "severity": "Medium"
+    },
+    {
+      "machineId": "machine-003",
+      "cveId": "CVE-2026-1007",
+      "severity": "Low"
+    },
+    {
+      "machineId": "machine-001",
+      "cveId": "CVE-2026-1001",
+      "severity": "Critical"
+    }
+  ]
+}

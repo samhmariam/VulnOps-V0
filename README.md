@@ -1,55 +1,59 @@
 # VulnOps V0.8
 
-One Python script, no external dependencies: combine Defender observations with local context, apply verification-backed closure, classify active findings, rank P2, and write one remediation CSV. V0.8 changes the observation source, not the control policy.
+One Python script, no external dependencies: combine mock scanner observations with local context, apply verification-backed closure, classify active findings, rank P2, and write one remediation CSV. V0.8 changes the observation source, not the control policy.
+
+Before V0.8, `findings.csv` already supplied a fully formed VulnOps finding, mixing technical observations with business context. V0.8 separates those sources: scanner-shaped observations + local asset context → VulnOps finding → existing control plane.
+
+V0.8 does NOT connect to a live scanner. V0.8 does NOT require Microsoft Defender credentials. V0.8 does NOT implement authentication. The mock data exists specifically to prove the scanner integration contract before adding a live vendor dependency.
 
 ## Source split
 
 | Source | Question answered | Information supplied |
 | --- | --- | --- |
-| Microsoft Defender: technical observation | What CVEs does this machine currently have? | Machine ID, CVE, scanner severity |
-| `data/asset_context.csv`: local context | What does this machine mean to our organization? | Stable asset ID, business criticality, exposure, ownership |
+| `data/mock_scanner_output.json`: represents technical output from an external vulnerability scanner | Which vulnerability was observed on which machine? | `machineId`, `cveId`, `severity` |
+| `data/asset_context.csv`: provides organization-specific context unavailable from the scanner | What does this machine mean to our organization? | `scanner_machine_id`, `asset_id`, `asset_criticality`, `internet_exposed`, `owner_team` |
 
-VulnOps joins them by `defender_machine_id` to build a finding, then removes Defender identifiers before policy processing. Microsoft Defender does NOT determine VulnOps priority. Microsoft Defender severity does NOT replace the current KEV-based policy.
+VulnOps normalizes `machineId`, `cveId`, and `severity`, then joins local context by `scanner_machine_id`. Scanner identifiers disappear before policy processing. Scanner severity does NOT determine VulnOps priority or replace the KEV-based policy.
+
+After joining, the finding contains exactly: `asset_id`, `cve`, `severity`, `asset_criticality`, `internet_exposed`, and `owner_team`. CVE and severity come from the mock scanner; asset identity, criticality, exposure, and ownership come from local context.
 
 ```text
- Microsoft Defender
-       │
-machine + CVE + severity
-       │
-       ▼
-   normalize
-       │
-       │       asset_context.csv
-       │       criticality
-       ├────── exposure
-       │       ownership
-       │
-       ▼
-VulnOps finding
-       │
-       ├──── CISA KEV
-       │
-       ├──── FIRST EPSS
-       │
-       ▼
-remediation lifecycle
-       │
-       ▼
-verification
-       │
-       ▼
-classification
-P0 / P1 / P2
-       │
-       ▼
-P2 ranking
-exposure → EPSS
-       │
-       ▼
-owner_team
-       │
-       ▼
-remediation_queue.csv
+       MOCK SCANNER
+            │
+    machine + CVE + severity
+            │
+            ▼
+        NORMALIZE
+            │
+            │
+            │       ASSET CONTEXT
+            │       criticality
+            ├────── exposure
+            │       ownership
+            │
+            ▼
+       VULNOPS FINDING
+            │
+       ┌────┴────┐
+       │         │
+      KEV       EPSS
+       │         │
+       └────┬────┘
+            ▼
+       lifecycle
+            │
+       verification
+            │
+       classification
+            │
+        P0/P1/P2
+            │
+       P2 ranking
+            │
+        owner_team
+            │
+            ▼
+ remediation_queue.csv
 ```
 
 This is the conceptual flow; execution checks lifecycle and verification before fetching KEV and EPSS. Only active findings reach classification and output.
@@ -58,60 +62,50 @@ This is the conceptual flow; execution checks lifecycle and verification before 
 
 ## Run
 
-Requirements: Python 3.10 or newer; internet access to Microsoft Defender, CISA, and FIRST. `MDE_ACCESS_TOKEN` must be supplied as an environment variable; absent or blank credentials fail retrieval. Never commit access tokens. VulnOps does not obtain or refresh tokens.
+Requirements: Python 3.10 or newer; internet access to CISA and FIRST. Scanner input is a local mock file; no scanner account, API, or authentication is required.
 
 ```sh
 python3 vulnops.py
 ```
 
-- Scanner input: Microsoft Defender, limited to machines in `data/asset_context.csv`
+- Scanner input: `data/mock_scanner_output.json`
+- Local asset context: `data/asset_context.csv`
 - Local lifecycle state: `state/remediation_status.csv`
 - Local verification evidence: `data/verification_results.csv`
 - Output: `output/remediation_queue.csv`
 - Paths: relative to `vulnops.py`; output directory created automatically
 
-## MANUAL LIVE SMOKE TEST
+## Scanner input and local context
 
-Supply `MDE_ACCESS_TOKEN` securely through the environment, replace sample IDs in `data/asset_context.csv` with your pilot machines, and keep the local remediation and verification CSVs present. Then run:
+`data/mock_scanner_output.json` contains a `value` list of observations, each with nonblank `machineId`, `cveId`, and `severity` strings. Loading preserves raw values; normalization lowercases severity and maps IDs to `scanner_machine_id` and `cve`. Duplicate machine/CVE observations collapse when severities agree and fail when they conflict.
 
-```sh
-python3 vulnops.py --live-smoke
+```json
+{
+  "value": [
+    {"machineId": "machine-001", "cveId": "CVE-2026-1001", "severity": "Critical"}
+  ]
+}
 ```
 
-The command checks the token before loading context, queries configured assets, and prints safe counts:
+Normalized severity must be `critical`, `high`, `medium`, or `low`; unexpected values fail.
 
-```text
-assets queried: 2
-raw observations: 7
-normalized findings: 5
-Wrote 4 findings to output/remediation_queue.csv
-```
-
-Raw observations count software records across pages; normalized findings count distinct machine/CVE pairs before lifecycle filtering. Exit status 0 means the entire pipeline completed. Zero vulnerabilities is valid and produces header-only output.
-
-Tokens and request headers are never printed. This manual check requires live access; automated tests require neither real credentials nor internet.
-
-## Local context and pilot scope
-
-`data/asset_context.csv` defines the explicit V0.8 pilot scope. Only Defender machines explicitly configured in this file are queried. Maximum: **20 pilot assets**; exceeding this fails before retrieval because bulk ingestion is not implemented.
+`data/asset_context.csv` supplies the organizational context:
 
 ```csv
-defender_machine_id,asset_id,asset_criticality,internet_exposed,owner_team
-abc123,payments-api-01,critical,true,payments-platform
-def456,hr-web-01,medium,false,workplace-it
+scanner_machine_id,asset_id,asset_criticality,internet_exposed,owner_team
+machine-001,payments-api-01,critical,true,payments-platform
+machine-002,hr-app-01,medium,false,workplace-it
+machine-003,legacy-db-01,high,unknown,data-platform
 ```
 
-- Replace sample machine IDs with actual Defender IDs
 - Exactly these five columns, in any order; nonempty values
 - Machine IDs and asset IDs must each be unique
 - Whitespace trimmed; asset criticality lowercased and limited to `critical`, `high`, `medium`, or `low`
 - Extra, missing, or duplicate columns and malformed rows rejected
 
-Defender supplies machine ID, CVE, and severity. VulnOps queries each configured machine with an encoded filter, fetching pages of 10,000 records, up to 10 pages per machine; needing another page fails rather than truncating. Duplicate machine/CVE observations collapse when severities agree and fail when they conflict.
+Every observation must have matching context; missing context fails instead of inventing defaults. An asset without scanner observations generates no finding; an empty `value` list is valid. Existing CSV columns are preserved: output `criticality` contains `asset_criticality`. `data/findings.csv` is no longer read; historical CSV data exists only in tests.
 
-The join maps `asset_criticality` to internal `criticality` and retains scanner severity internally. Output columns are unchanged. `data/findings.csv` is no longer read; historical CSV data exists only in tests.
-
-Defender machineId is NOT the VulnOps lifecycle identity. VulnOps asset_id remains the lifecycle identity: each finding's state and verification evidence are keyed by `(asset_id, cve)`.
+Scanner machine IDs are integration identifiers, not lifecycle identities. VulnOps state and verification remain keyed by `(asset_id, cve)`.
 
 `internet_exposed` describes the asset: `true` means a publicly reachable interface, `false` means known non-exposure, and `unknown` means insufficient evidence. Only lowercase strings are accepted. `true` does not prove the vulnerable component is remotely exploitable; `false` does not prove safety.
 
@@ -119,7 +113,7 @@ Defender machineId is NOT the VulnOps lifecycle identity. VulnOps asset_id remai
 
 Activity depends on `remediation_status` plus derived `verification_status`. Only `resolved` + `passed` leaves the active queue; every other valid combination remains active.
 
-`state/remediation_status.csv` records the operator's claim, separately from current Defender observations:
+`state/remediation_status.csv` records the operator's claim, separately from current mock scanner observations:
 
 ```csv
 asset_id,cve,remediation_status
@@ -197,7 +191,7 @@ owner_team does NOT affect priority. owner_team does NOT affect ranking. unknown
 
 A resolved remediation claim **and** passed verification. V0.8 retains the verification-backed closure introduced in V0.7.
 
-VulnOps V0.7 does not consider an operator's resolved declaration sufficient evidence for closure.
+An operator's resolved declaration alone is insufficient evidence for closure.
 
 Verification is only as trustworthy as the supplied verification scan/evidence. V0.8 does not yet validate scanner coverage, freshness, authentication, or provenance.
 
@@ -225,4 +219,4 @@ FIRST receives one request for unique active CVEs, limited to 2,000 characters i
 python3 -m unittest discover -s tests -v
 ```
 
-Controlled responses; no network requests. Tests cover classification, ranking, missing data, ownership, state/evidence validation, all four verification outcomes, premature closure, and the complete discovery → claim → failed verification → passed verification loop.
+Controlled responses; no credentials or network requests. Tests cover scanner loading, normalization, duplicate/conflicting observations, context joins, missing context, empty input, source equivalence, and the existing classification, ranking, ownership, lifecycle, and verification behaviour.

@@ -1,3 +1,4 @@
-defender_machine_id,asset_id,asset_criticality,internet_exposed,owner_team
-abc123,payments-api-01,critical,true,payments-platform
-def456,hr-web-01,medium,false,workplace-it
+scanner_machine_id,asset_id,asset_criticality,internet_exposed,owner_team
+machine-001,payments-api-01,critical,true,payments-platform
+machine-002,hr-app-01,medium,false,workplace-it
+machine-003,legacy-db-01,high,unknown,data-platform

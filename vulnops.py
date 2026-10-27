@@ -1,121 +1,72 @@
 """Load findings, enrich with KEV and EPSS, prioritize, explain, and write a CSV."""
 
-import argparse
 import csv
 import json
-import os
 from pathlib import Path
 import re
 import sys
 from urllib.parse import urlencode
-from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+from urllib.request import urlopen
 
 
 ROOT = Path(__file__).resolve().parent
 KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 EPSS_URL = "https://api.first.org/data/v1/epss"
-DEFENDER_URL = "https://api.security.microsoft.com/api/vulnerabilities/machinesVulnerabilities"
 FINDING_COLUMNS = ("asset_id", "criticality", "cve", "internet_exposed", "owner_team")
 RESULT_COLUMNS = ("kev", "epss_score", "epss_percentile", "priority", "reason", "remediation_status")
 
 
-def normalize_defender_findings(records):
+def load_scanner_output(path):
+    """Read scanner records, validating structure without changing their values."""
+    with path.open(encoding="utf-8-sig") as source:
+        payload = json.load(source)
+    if not isinstance(payload, dict) or "value" not in payload:
+        raise ValueError("Scanner output must be a JSON object containing a value list.")
+    if not isinstance(payload["value"], list):
+        raise ValueError("Scanner output value must be a list.")
+    for index, record in enumerate(payload["value"], start=1):
+        if not isinstance(record, dict):
+            raise ValueError(f"Scanner observation {index} must be an object.")
+        for field in ("machineId", "cveId", "severity"):
+            if not isinstance(record.get(field), str) or not record[field].strip():
+                raise ValueError(f"Scanner observation {index} requires a non-empty {field} string.")
+    return payload["value"]
+
+
+def normalize_scanner_observations(records):
     """Keep one scanner observation per machine/CVE, rejecting severity conflicts."""
     observations = {}
     for entry in records:
         if not isinstance(entry, dict) or any(
                 not isinstance(entry.get(field), str) or not entry[field].strip()
                 for field in ("machineId", "cveId", "severity")):
-            raise ValueError("Defender observation requires non-empty machineId, cveId, and severity strings.")
+            raise ValueError("Scanner observation requires non-empty machineId, cveId, and severity strings.")
         machine_id = entry["machineId"].strip()
         cve = entry["cveId"].strip().upper()
         if not re.fullmatch(r"CVE-[0-9]{4}-[0-9]{4,}", cve):
-            raise ValueError("Defender observation contains an invalid CVE.")
+            raise ValueError("Scanner observation contains an invalid CVE.")
         severity = entry["severity"].strip().lower()
         if severity not in ("critical", "high", "medium", "low"):
-            raise ValueError("Defender observation has unexpected severity; expected critical, high, medium, or low.")
+            raise ValueError("Scanner observation has unexpected severity; expected critical, high, medium, or low.")
         key = (machine_id, cve)
         if key in observations:
             if observations[key]["severity"] != severity:
-                raise ValueError("Defender observations have conflicting severity for the same machine/CVE.")
+                raise ValueError("Scanner observations have conflicting severity for the same machine/CVE.")
             continue
-        observations[key] = {"defender_machine_id": machine_id, "cve": cve, "severity": severity}
+        observations[key] = {"scanner_machine_id": machine_id, "cve": cve, "severity": severity}
     return list(observations.values())
 
 
-def load_defender_findings(asset_context, *, show_summary=False):
-    """Retrieve normalized observations only for the configured pilot machines."""
-    if len(asset_context) > 20:
-        raise ValueError("V0.8 is a pilot integration limited to 20 assets; bulk ingestion has not yet been implemented.")
-    if not asset_context and not show_summary:
-        return []
-    token = os.environ.get("MDE_ACCESS_TOKEN", "").strip()
-    if not token:
-        raise ValueError("Defender authentication requires a non-empty MDE_ACCESS_TOKEN environment variable.")
-    findings = []
-    for machine_id in asset_context:
-        for page in range(10):
-            try:
-                query = urlencode({"$filter": "machineId eq '" + machine_id.replace("'", "''") + "'",
-                                   "$top": 10000, "$skip": page * 10000})
-                request = Request(f"{DEFENDER_URL}?{query}", headers={"Authorization": f"Bearer {token}"})
-                with urlopen(request, timeout=30) as response:
-                    payload = json.load(response)
-            except HTTPError as error:
-                if error.code == 401:
-                    message = "Defender authentication failure (HTTP 401)."
-                elif error.code == 403:
-                    message = "Defender authorization/permission failure (HTTP 403)."
-                elif error.code == 429:
-                    message = "Defender rate limiting (HTTP 429)."
-                elif 500 <= error.code <= 599:
-                    message = "Defender service failure (HTTP 5xx)."
-                else:
-                    message = "Defender retrieval failed with an unexpected HTTP response."
-                raise ValueError(message) from None
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                raise ValueError("Defender returned invalid JSON.") from None
-            except OSError:
-                raise ValueError("Defender network retrieval failed.") from None
-            except ValueError:
-                raise ValueError("Defender request failed.") from None
-            if not isinstance(payload, dict) or "value" not in payload:
-                raise ValueError("Defender response is missing the required value list.")
-            if not isinstance(payload["value"], list):
-                raise ValueError("Defender response value must be a list.")
-            if len(payload["value"]) > 10000:
-                raise ValueError("Defender response exceeded the requested page size of 10000 rows.")
-            for entry in payload["value"]:
-                if not isinstance(entry, dict) or any(
-                        not isinstance(entry.get(field), str) or not entry[field].strip()
-                        for field in ("machineId", "cveId", "severity")):
-                    raise ValueError("Defender observation requires non-empty machineId, cveId, and severity strings.")
-                if entry["machineId"].strip() != machine_id:
-                    raise ValueError("Defender returned an observation outside the requested pilot machine scope.")
-                findings.append({field: entry[field] for field in ("machineId", "cveId", "severity")})
-            if len(payload["value"]) < 10000:
-                break
-        else:
-            raise ValueError("Defender pagination requires more than the maximum 10 pages per machine; refusing to truncate findings.")
-    observations = normalize_defender_findings(findings)
-    if show_summary:
-        print(f"assets queried: {len(asset_context)}")
-        print(f"raw observations: {len(findings)}")
-        print(f"normalized findings: {len(observations)}")
-    return observations
-
-
 def load_asset_context(path):
-    """Load a one-to-one Defender machine to local asset context mapping."""
-    required = ("defender_machine_id", "asset_id", "asset_criticality", "internet_exposed", "owner_team")
+    """Load a one-to-one scanner machine to local asset context mapping."""
+    required = ("scanner_machine_id", "asset_id", "asset_criticality", "internet_exposed", "owner_team")
     context = {}
     asset_ids = set()
     with path.open(newline="", encoding="utf-8-sig") as source:
         reader = csv.DictReader(source)
         columns = reader.fieldnames
         if not columns or len(columns) != len(required) or set(columns) != set(required):
-            raise ValueError("Asset context CSV must contain exactly defender_machine_id, asset_id, asset_criticality, internet_exposed, and owner_team columns.")
+            raise ValueError("Asset context CSV must contain exactly scanner_machine_id, asset_id, asset_criticality, internet_exposed, and owner_team columns.")
         for row in reader:
             if None in row or any(value is None for value in row.values()):
                 raise ValueError(f"Asset context record ending at line {reader.line_num} has the wrong number of fields.")
@@ -128,9 +79,9 @@ def load_asset_context(path):
                 raise ValueError(f"Asset context record ending at line {reader.line_num} has invalid asset_criticality; expected critical, high, medium, or low.")
             if row["internet_exposed"] not in ("true", "false", "unknown"):
                 raise ValueError(f"Asset context record ending at line {reader.line_num} has invalid internet_exposed; expected true, false, or unknown.")
-            machine_id = row.pop("defender_machine_id")
+            machine_id = row.pop("scanner_machine_id")
             if machine_id in context:
-                raise ValueError(f"Duplicate defender_machine_id {machine_id!r} at line {reader.line_num}.")
+                raise ValueError(f"Duplicate scanner_machine_id {machine_id!r} at line {reader.line_num}.")
             if row["asset_id"] in asset_ids:
                 raise ValueError(f"Duplicate asset_id {row['asset_id']!r} at line {reader.line_num}.")
             context[machine_id] = row
@@ -139,18 +90,18 @@ def load_asset_context(path):
 
 
 def build_findings(observations, asset_context):
-    """Join scanner observations to local context using existing finding fields."""
+    """Join scanner facts and local context, leaving scanner identifiers behind."""
     findings = []
     for observation in observations:
-        machine_id = observation["defender_machine_id"]
+        machine_id = observation["scanner_machine_id"]
         if machine_id not in asset_context:
-            raise ValueError("Defender observation has no matching asset context.")
+            raise ValueError(f"Scanner observation for {machine_id!r} has no matching asset context; check asset_context.csv.")
         context = asset_context[machine_id]
         findings.append({
             "asset_id": context["asset_id"],
             "cve": observation["cve"],
             "severity": observation["severity"],
-            "criticality": context["asset_criticality"],
+            "asset_criticality": context["asset_criticality"],
             "internet_exposed": context["internet_exposed"],
             "owner_team": context["owner_team"],
         })
@@ -316,7 +267,7 @@ def prioritize(findings, kev_cves):
     results = []
     for finding in findings:
         is_kev = finding["cve"] in kev_cves
-        if is_kev and finding["criticality"] == "critical":
+        if is_kev and finding["asset_criticality"] == "critical":
             priority = "P0"
             reason = "Rule 1: CVE is in CISA KEV and asset criticality is critical."
         elif is_kev:
@@ -334,15 +285,15 @@ def write_queue(path, results):
     with path.open("w", newline="", encoding="utf-8") as destination:
         writer = csv.DictWriter(destination, fieldnames=[*FINDING_COLUMNS, *RESULT_COLUMNS])
         writer.writeheader()
-        writer.writerows({column: row.get(column) for column in writer.fieldnames} for row in results)
+        writer.writerows({column: row.get("asset_criticality" if column == "criticality" else column)
+                          for column in writer.fieldnames} for row in results)
 
 
-def main(*, live_smoke=False):
+def main():
     try:
-        if live_smoke and not os.environ.get("MDE_ACCESS_TOKEN", "").strip():
-            raise ValueError("Defender authentication requires a non-empty MDE_ACCESS_TOKEN environment variable.")
+        raw_scanner = load_scanner_output(ROOT / "data" / "mock_scanner_output.json")
+        observations = normalize_scanner_observations(raw_scanner)
         asset_context = load_asset_context(ROOT / "data" / "asset_context.csv")
-        observations = load_defender_findings(asset_context, show_summary=live_smoke)
         findings = build_findings(observations, asset_context)
         statuses = load_remediation_statuses(ROOT / "state" / "remediation_status.csv")
         findings = apply_remediation_status(findings, statuses)
@@ -371,7 +322,4 @@ def main(*, live_smoke=False):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate the active VulnOps remediation queue.")
-    parser.add_argument("--live-smoke", action="store_true", help="Run the live pipeline with safe scanner counts.")
-    arguments = parser.parse_args()
-    sys.exit(main(live_smoke=arguments.live_smoke))
+    sys.exit(main())

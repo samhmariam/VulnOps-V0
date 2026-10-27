@@ -1,5 +1,0 @@
-asset_id,criticality,cve,internet_exposed,owner_team
-workstation-01,medium,CVE-2099-99999,false,workplace-it
-web-server-01,high,CVE-2021-44228,true,payments-platform
-identity-server-01,critical,CVE-2021-44228,unknown,identity
-application-server-01,critical,CVE-2026-43500,true,unknown
