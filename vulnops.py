@@ -12,7 +12,7 @@ from urllib.request import urlopen
 ROOT = Path(__file__).resolve().parent
 KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 EPSS_URL = "https://api.first.org/data/v1/epss"
-REQUIRED_COLUMNS = ("asset_id", "criticality", "cve", "internet_exposed")
+REQUIRED_COLUMNS = ("asset_id", "criticality", "cve", "internet_exposed", "owner_team")
 RESULT_COLUMNS = ("kev", "epss_score", "epss_percentile", "priority", "reason")
 
 
@@ -21,7 +21,7 @@ def load_findings(path):
         reader = csv.DictReader(source)
         columns = reader.fieldnames
         if not columns or len(columns) != len(REQUIRED_COLUMNS) or set(columns) != set(REQUIRED_COLUMNS):
-            raise ValueError("Findings CSV must contain exactly asset_id, criticality, cve, and internet_exposed columns.")
+            raise ValueError("Findings CSV must contain exactly asset_id, criticality, cve, internet_exposed, and owner_team columns.")
         findings = []
         for row in reader:
             if None in row or any(value is None for value in row.values()):
