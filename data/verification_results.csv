@@ -1,0 +1,3 @@
+asset_id,cve,vulnerability_present
+payments-api-01,CVE-2026-1234,false
+hr-web-01,CVE-2026-5678,true

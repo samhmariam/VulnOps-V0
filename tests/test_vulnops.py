@@ -14,6 +14,155 @@ import vulnops
 
 
 class VulnOpsTests(unittest.TestCase):
+    def test_apply_verification_status_derives_four_outcomes_and_preserves_fields(self):
+        fields = {"cve": "CVE-2026-1234", "criticality": "critical", "asset_criticality": "critical",
+                  "severity": "high", "internet_exposed": "false", "owner_team": "payments-platform",
+                  "kev": "true", "epss_score": 0.01, "epss_percentile": 0.1, "priority": "P0",
+                  "reason": "Rule 1: CVE is in CISA KEV and asset criticality is critical."}
+        findings = [{**fields, "asset_id": asset, "remediation_status": remediation}
+                    for asset, remediation in (("A", "open"), ("B", "resolved"), ("C", "resolved"), ("D", "resolved"))]
+        verification_results = {("C", "CVE-2026-1234"): True, ("D", "CVE-2026-1234"): False}
+        originals = [finding.copy() for finding in findings]
+        original_evidence = verification_results.copy()
+
+        results = vulnops.apply_verification_status(findings, verification_results)
+
+        self.assertEqual([row["asset_id"] for row in results], ["A", "B", "C", "D"])
+        for finding, result, expected in zip(findings, results, ("not_applicable", "unverified", "failed", "passed")):
+            with self.subTest(asset_id=finding["asset_id"]):
+                self.assertEqual(result, {**finding, "verification_status": expected})
+                self.assertEqual(set(result) - set(finding), {"verification_status"})
+                self.assertIsNot(result, finding)
+        self.assertEqual(findings, originals)
+        self.assertEqual(verification_results, original_evidence)
+        self.assertEqual(vulnops.apply_verification_status([], verification_results), [])
+
+    def test_identical_kev_critical_finding_stays_p0_for_all_verification_outcomes(self):
+        cases = [("A", "open", None, "not_applicable", True),
+                 ("B", "resolved", None, "unverified", True),
+                 ("C", "resolved", True, "failed", True),
+                 ("D", "resolved", False, "passed", False)]
+        cve = "CVE-2026-1234"
+        key = ("critical-server", cve)
+        epss = {cve: {"epss_score": 0.01, "epss_percentile": 0.1}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "data").mkdir()
+            (root / "state").mkdir()
+            input_path = root / "data" / "findings.csv"
+            input_path.write_text("asset_id,criticality,cve,internet_exposed,owner_team\n"
+                                  "critical-server,critical,CVE-2026-1234,false,payments-platform\n")
+            baseline = vulnops.prioritize(vulnops.enrich_with_epss(vulnops.load_findings(input_path), epss), {cve})[0]
+            self.assertEqual(baseline["priority"], "P0")
+            for case, remediation, present, verification, active in cases:
+                with self.subTest(case=case):
+                    state_path = root / "state" / "remediation_status.csv"
+                    evidence_path = root / "data" / "verification_results.csv"
+                    state_path.write_text(f"asset_id,cve,remediation_status\ncritical-server,{cve},{remediation}\n")
+                    evidence_path.write_text("asset_id,cve,vulnerability_present\n" +
+                                             ("" if present is None else f"critical-server,{cve},{str(present).lower()}\n"))
+                    findings = vulnops.apply_remediation_status(vulnops.load_findings(input_path),
+                                                                vulnops.load_remediation_statuses(state_path))
+                    findings = vulnops.apply_verification_status(findings, vulnops.load_verification_results(evidence_path))
+                    findings = vulnops.enrich_with_epss(findings, epss)
+
+                    # Classification is tested before queue filtering, including passed case D.
+                    result = vulnops.prioritize(findings, {cve})[0]
+
+                    self.assertEqual(result["priority"], "P0")
+                    self.assertEqual(result["remediation_status"], remediation)
+                    self.assertEqual(result["verification_status"], verification)
+                    self.assertEqual({field: result[field] for field in baseline}, baseline)
+                    with patch("vulnops.ROOT", root), patch("vulnops.load_kev", return_value={cve}):
+                        with patch("vulnops.load_epss", return_value=epss), patch("sys.stdout", new_callable=io.StringIO):
+                            self.assertEqual(vulnops.main(), 0)
+                    with (root / "output" / "remediation_queue.csv").open(newline="") as output:
+                        rows = list(csv.DictReader(output))
+                    self.assertEqual(len(rows), 1 if active else 0)
+                    if active:
+                        self.assertEqual(rows[0]["priority"], "P0")
+                        self.assertEqual(rows[0]["reason"], baseline["reason"])
+                    self.assertEqual(vulnops.load_remediation_statuses(state_path)[key], remediation)
+
+    def test_open_finding_never_infers_verification_success_or_failure(self):
+        finding = {"asset_id": "A", "cve": "CVE-2026-1234", "remediation_status": "open"}
+        for present in (True, False):
+            with self.subTest(vulnerability_present=present):
+                results = vulnops.apply_verification_status([finding], {("A", "CVE-2026-1234"): present})
+                self.assertEqual(results, [{**finding, "verification_status": "not_applicable"}])
+
+    def test_apply_verification_status_rejects_unsupported_cases(self):
+        finding = {"asset_id": "A", "cve": "CVE-2026-1234", "remediation_status": "resolved"}
+        with self.assertRaisesRegex(ValueError, "Invalid remediation_status"):
+            vulnops.apply_verification_status([{**finding, "remediation_status": "closed"}], {})
+        for invalid in (None, "false", 0, 1):
+            with self.subTest(evidence=invalid):
+                with self.assertRaisesRegex(ValueError, "expected a boolean"):
+                    vulnops.apply_verification_status([finding], {("A", "CVE-2026-1234"): invalid})
+
+    def test_verification_results_load_true_and_false_as_booleans(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "verification_results.csv"
+            source.write_text("asset_id,cve,vulnerability_present\n"
+                              "payments-api-01,CVE-2026-1234,false\n"
+                              "hr-web-01,CVE-2026-1234,true\n")
+            results = vulnops.load_verification_results(source)
+            self.assertEqual(set(results), {("payments-api-01", "CVE-2026-1234"), ("hr-web-01", "CVE-2026-1234")})
+            self.assertIs(results[("payments-api-01", "CVE-2026-1234")], False)
+            self.assertIs(results[("hr-web-01", "CVE-2026-1234")], True)
+
+    def test_verification_results_reject_blank_fields_and_invalid_values(self):
+        rows = [",CVE-2026-1234,true", "server,,false", "server,CVE-2026-1234,",
+                "server,CVE-2026-1234,   ", "server,CVE-2026-1234,unknown",
+                "server,CVE-2026-1234,yes", "server,CVE-2026-1234,True",
+                "server,CVE-2026-1234,FALSE", "server,CVE-2026-1234,0"]
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "verification_results.csv"
+            for row in rows:
+                with self.subTest(row=row):
+                    source.write_text(f"asset_id,cve,vulnerability_present\n{row}\n")
+                    with self.assertRaisesRegex(ValueError, "Verification record.*(empty|invalid)"):
+                        vulnops.load_verification_results(source)
+
+    def test_verification_results_reject_duplicate_keys_even_after_false(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "verification_results.csv"
+            for duplicate in ("server,CVE-2026-1234,false", "server,CVE-2026-1234,true",
+                              " server , cve-2026-1234 ,true"):
+                with self.subTest(duplicate=duplicate):
+                    source.write_text("asset_id,cve,vulnerability_present\n"
+                                      f"server,CVE-2026-1234,false\n{duplicate}\n")
+                    with self.assertRaisesRegex(ValueError, "Duplicate verification result.*server.*CVE-2026-1234"):
+                        vulnops.load_verification_results(source)
+
+    def test_verification_results_reject_missing_or_invalid_columns(self):
+        headers = ["", "cve,vulnerability_present", "asset_id,vulnerability_present", "asset_id,cve",
+                   "asset_id,cve,cve", "asset_id,cve,vulnerability_present,extra"]
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "verification_results.csv"
+            for header in headers:
+                with self.subTest(header=header):
+                    source.write_text(header + "\n")
+                    with self.assertRaisesRegex(ValueError, "must contain exactly"):
+                        vulnops.load_verification_results(source)
+
+    def test_verification_results_reject_malformed_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "verification_results.csv"
+            for row in ("server,CVE-2026-1234", "server,CVE-2026-1234,false,extra"):
+                with self.subTest(row=row):
+                    source.write_text(f"asset_id,cve,vulnerability_present\n{row}\n")
+                    with self.assertRaisesRegex(ValueError, "wrong number of fields"):
+                        vulnops.load_verification_results(source)
+
+    def test_verification_results_accept_empty_evidence_and_normalize_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "verification_results.csv"
+            source.write_text("vulnerability_present,cve,asset_id\n")
+            self.assertEqual(vulnops.load_verification_results(source), {})
+            source.write_text("vulnerability_present,cve,asset_id\nfalse, cve-2026-1234 , server \n")
+            self.assertEqual(vulnops.load_verification_results(source), {("server", "CVE-2026-1234"): False})
+
     def test_remediation_statuses_accept_open_and_resolved_for_separate_assets(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "remediation_status.csv"
@@ -108,7 +257,247 @@ class VulnOpsTests(unittest.TestCase):
         self.assertEqual(statuses, original_statuses)
         self.assertEqual(vulnops.apply_remediation_status([], statuses), [])
 
-    def test_active_queue_keeps_open_and_unrecorded_findings_but_excludes_resolved(self):
+    def test_failed_verification_keeps_resolved_payments_p0_active_without_rewriting_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "data").mkdir()
+            (root / "state").mkdir()
+            (root / "data" / "findings.csv").write_text(
+                "asset_id,criticality,cve,internet_exposed,owner_team\n"
+                "payments-api-01,critical,CVE-2026-1234,false,payments-platform\n")
+            state_path = root / "state" / "remediation_status.csv"
+            state_path.write_text("asset_id,cve,remediation_status\npayments-api-01,CVE-2026-1234,resolved\n")
+            evidence_path = root / "data" / "verification_results.csv"
+            evidence_path.write_text("asset_id,cve,vulnerability_present\npayments-api-01,CVE-2026-1234,true\n")
+            original_state = state_path.read_bytes()
+            original_evidence = evidence_path.read_bytes()
+            kev = {"vulnerabilities": [{"cveID": "CVE-2026-1234"}]}
+            epss = {"status": "OK", "status-code": 200, "total": 1, "data": [
+                {"cve": "CVE-2026-1234", "epss": "0.01", "percentile": "0.1"},
+            ]}
+            responses = [io.BytesIO(json.dumps(feed).encode()) for feed in (kev, epss)]
+            with patch("vulnops.ROOT", root), patch("vulnops.urlopen", side_effect=responses):
+                with patch("vulnops.write_queue", wraps=vulnops.write_queue) as write:
+                    with patch("sys.stdout", new_callable=io.StringIO):
+                        self.assertEqual(vulnops.main(), 0)
+            queue = write.call_args.args[1]
+            self.assertEqual(len(queue), 1)
+            finding = queue[0]
+            self.assertEqual(finding["asset_id"], "payments-api-01")
+            self.assertEqual(finding["remediation_status"], "resolved")
+            self.assertEqual(finding["verification_status"], "failed")
+            self.assertEqual(finding["priority"], "P0")
+            with (root / "output" / "remediation_queue.csv").open(newline="") as output:
+                rows = list(csv.DictReader(output))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["asset_id"], "payments-api-01")
+            self.assertEqual(rows[0]["remediation_status"], "resolved")
+            self.assertEqual(rows[0]["priority"], "P0")
+            self.assertEqual(rows[0]["reason"], "Rule 1: CVE is in CISA KEV and asset criticality is critical.")
+            self.assertEqual(state_path.read_bytes(), original_state)
+            self.assertEqual(evidence_path.read_bytes(), original_evidence)
+            self.assertEqual(vulnops.load_remediation_statuses(state_path)[("payments-api-01", "CVE-2026-1234")], "resolved")
+
+    def test_successful_verification_excludes_payments_finding_without_deleting_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "data").mkdir()
+            (root / "state").mkdir()
+            input_path = root / "data" / "findings.csv"
+            state_path = root / "state" / "remediation_status.csv"
+            evidence_path = root / "data" / "verification_results.csv"
+            input_path.write_text("asset_id,criticality,cve,internet_exposed,owner_team\n"
+                                  "payments-api-01,critical,CVE-2026-1234,false,payments-platform\n")
+            state_path.write_text("asset_id,cve,remediation_status\npayments-api-01,CVE-2026-1234,resolved\n")
+            evidence_path.write_text("asset_id,cve,vulnerability_present\npayments-api-01,CVE-2026-1234,false\n")
+            original_inputs = {path: path.read_bytes() for path in (input_path, state_path, evidence_path)}
+            kev_cves = {"CVE-2026-1234"}
+            baseline = vulnops.prioritize(vulnops.load_findings(input_path), kev_cves)[0]
+            kev = io.BytesIO(b'{"vulnerabilities": [{"cveID": "CVE-2026-1234"}]}')
+            with patch("vulnops.ROOT", root), patch("vulnops.urlopen", return_value=kev):
+                with patch("vulnops.apply_verification_status", wraps=vulnops.apply_verification_status) as verify:
+                    with patch("vulnops.load_epss", wraps=vulnops.load_epss) as epss:
+                        with patch("vulnops.prioritize", wraps=vulnops.prioritize) as classify:
+                            with patch("sys.stdout", new_callable=io.StringIO):
+                                self.assertEqual(vulnops.main(), 0)
+            verify.assert_called_once()
+            derived = vulnops.apply_verification_status(*verify.call_args.args)
+            self.assertEqual(len(derived), 1)
+            self.assertEqual(derived[0]["remediation_status"], "resolved")
+            self.assertEqual(derived[0]["verification_status"], "passed")
+            # Closure removes queue membership; it does not downgrade the underlying risk class.
+            classified = vulnops.prioritize(derived, kev_cves)[0]
+            self.assertEqual(classified["priority"], "P0")
+            self.assertEqual({field: classified[field] for field in baseline}, baseline)
+            classify.assert_called_once_with([], kev_cves)
+            epss.assert_called_once_with([])
+            with (root / "output" / "remediation_queue.csv").open(newline="") as output:
+                self.assertEqual(list(csv.DictReader(output)), [])
+            self.assertEqual({path: path.read_bytes() for path in original_inputs}, original_inputs)
+            self.assertEqual(len(vulnops.load_findings(input_path)), 1)
+            key = ("payments-api-01", "CVE-2026-1234")
+            self.assertEqual(vulnops.load_remediation_statuses(state_path)[key], "resolved")
+            self.assertIs(vulnops.load_verification_results(evidence_path)[key], False)
+
+    def test_one_finding_completes_v07_verification_control_loop(self):
+        phases = [("discovery", None, None, "open", "not_applicable", True),
+                  ("remediation claim", "resolved", None, "resolved", "unverified", True),
+                  ("failed verification", "resolved", "true", "resolved", "failed", True),
+                  ("successful verification", "resolved", "false", "resolved", "passed", False)]
+        cve = "CVE-2026-1234"
+        epss = {cve: {"epss_score": 0.9, "epss_percentile": 0.98}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "data").mkdir()
+            (root / "state").mkdir()
+            input_path = root / "data" / "findings.csv"
+            state_path = root / "state" / "remediation_status.csv"
+            evidence_path = root / "data" / "verification_results.csv"
+            input_path.write_text("asset_id,criticality,cve,internet_exposed,owner_team\n"
+                                  f"payments-api-01,critical,{cve},true,payments-platform\n")
+            original_input = input_path.read_bytes()
+            baseline = vulnops.prioritize(
+                vulnops.enrich_with_epss(vulnops.load_findings(input_path), epss), set())[0]
+            self.assertEqual(baseline["priority"], "P2")
+            for phase, claim, evidence, status, verification, active in phases:
+                with self.subTest(phase=phase):
+                    state_path.write_text("asset_id,cve,remediation_status\n" +
+                                          (f"payments-api-01,{cve},{claim}\n" if claim else ""))
+                    evidence_path.write_text("asset_id,cve,vulnerability_present\n" +
+                                             (f"payments-api-01,{cve},{evidence}\n" if evidence else ""))
+                    originals = {path: path.read_bytes() for path in (state_path, evidence_path)}
+                    with patch("vulnops.ROOT", root), patch("vulnops.load_kev", return_value=set()):
+                        with patch("vulnops.load_epss", return_value=epss):
+                            with patch("vulnops.apply_verification_status", wraps=vulnops.apply_verification_status) as verify:
+                                with patch("vulnops.write_queue", wraps=vulnops.write_queue) as write:
+                                    with patch("sys.stdout", new_callable=io.StringIO):
+                                        self.assertEqual(vulnops.main(), 0)
+                    derived = vulnops.apply_verification_status(*verify.call_args.args)
+                    self.assertEqual(len(derived), 1)
+                    self.assertEqual(derived[0]["remediation_status"], status)
+                    self.assertEqual(derived[0]["verification_status"], verification)
+                    # Closure affects membership, not the finding's underlying classification or context.
+                    classified = vulnops.prioritize(vulnops.enrich_with_epss(derived, epss), set())[0]
+                    self.assertEqual({field: classified[field] for field in baseline}, baseline)
+                    self.assertEqual(write.call_args.args[1], [classified] if active else [])
+                    with (root / "output" / "remediation_queue.csv").open(newline="") as output:
+                        rows = list(csv.DictReader(output))
+                    self.assertEqual(len(rows), int(active))
+                    if active:
+                        self.assertEqual(rows[0]["cve"], cve)
+                        self.assertEqual(rows[0]["priority"], baseline["priority"])
+                        self.assertEqual(rows[0]["reason"], baseline["reason"])
+                        self.assertEqual(rows[0]["owner_team"], baseline["owner_team"])
+                        self.assertEqual(rows[0]["remediation_status"], status)
+                    self.assertEqual(input_path.read_bytes(), original_input)
+                    self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+
+    def test_premature_closure_without_verification_keeps_finding_active_and_rank_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "data").mkdir()
+            (root / "state").mkdir()
+            input_path = root / "data" / "findings.csv"
+            state_path = root / "state" / "remediation_status.csv"
+            evidence_path = root / "data" / "verification_results.csv"
+            input_path.write_text(
+                "asset_id,criticality,cve,internet_exposed,owner_team\n"
+                "payments-api-01,critical,CVE-2026-1234,true,payments-platform\n"
+                "lower-score,critical,CVE-2026-1235,true,identity\n"
+                "higher-score,critical,CVE-2026-1236,true,data-platform\n")
+            evidence_path.write_text("asset_id,cve,vulnerability_present\n")
+            original_evidence = evidence_path.read_bytes()
+            original_findings = input_path.read_bytes()
+            epss = {cve: {"epss_score": score, "epss_percentile": 0.9}
+                    for cve, score in (("CVE-2026-1234", 0.5), ("CVE-2026-1235", 0.1),
+                                       ("CVE-2026-1236", 0.9))}
+            queues = {}
+            for status in ("open", "resolved"):
+                with self.subTest(remediation_status=status):
+                    state_path.write_text("asset_id,cve,remediation_status\n"
+                                          f"payments-api-01,CVE-2026-1234,{status}\n")
+                    original_state = state_path.read_bytes()
+                    with patch("vulnops.ROOT", root), patch("vulnops.load_kev", return_value=set()):
+                        with patch("vulnops.load_epss", return_value=epss):
+                            with patch("vulnops.write_queue", wraps=vulnops.write_queue) as write:
+                                with patch("sys.stdout", new_callable=io.StringIO):
+                                    self.assertEqual(vulnops.main(), 0)
+                    internal = write.call_args.args[1]
+                    target = next(row for row in internal if row["asset_id"] == "payments-api-01")
+                    self.assertEqual(target["remediation_status"], status)
+                    self.assertEqual(target["verification_status"],
+                                     "unverified" if status == "resolved" else "not_applicable")
+                    with (root / "output" / "remediation_queue.csv").open(newline="") as output:
+                        queues[status] = list(csv.DictReader(output))
+                    self.assertEqual([row["asset_id"] for row in queues[status]],
+                                     ["higher-score", "payments-api-01", "lower-score"])
+                    target_output = queues[status][1]
+                    self.assertEqual(target_output["remediation_status"], status)
+                    self.assertEqual(target_output["priority"], "P2")
+                    self.assertEqual(target_output["owner_team"], "payments-platform")
+                    self.assertEqual(target_output["reason"], "Rule 3: CVE is not in CISA KEV.")
+                    self.assertEqual(state_path.read_bytes(), original_state)
+                    self.assertEqual(evidence_path.read_bytes(), original_evidence)
+                    self.assertEqual(input_path.read_bytes(), original_findings)
+                    self.assertEqual(vulnops.load_verification_results(evidence_path), {})
+            # Changing only the operator claim preserves every other output field and row position.
+            for before, after in zip(queues["open"], queues["resolved"]):
+                self.assertEqual({key: value for key, value in before.items() if key != "remediation_status"},
+                                 {key: value for key, value in after.items() if key != "remediation_status"})
+
+    def test_active_queue_excludes_only_resolved_findings_with_passed_verification(self):
+        source = ("asset_id,criticality,cve,internet_exposed,owner_team\n"
+                  "D,critical,CVE-2026-1234,true,payments-platform\n"
+                  "C,critical,CVE-2026-5678,true,payments-platform\n"
+                  "B,medium,CVE-2026-1234,false,payments-platform\n"
+                  "A,critical,CVE-2026-1234,false,payments-platform\n")
+        state = ("asset_id,cve,remediation_status\n"
+                 "A,CVE-2026-1234,open\nB,CVE-2026-1234,resolved\n"
+                 "C,CVE-2026-5678,resolved\nD,CVE-2026-1234,resolved\n")
+        evidence = ("asset_id,cve,vulnerability_present\n"
+                    "A,CVE-2026-1234,false\nC,CVE-2026-5678,true\nD,CVE-2026-1234,false\n")
+        epss = {"CVE-2026-1234": {"epss_score": 0.01, "epss_percentile": 0.1},
+                "CVE-2026-5678": {"epss_score": 0.99, "epss_percentile": 0.999}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "data").mkdir()
+            (root / "state").mkdir()
+            paths = {root / "data" / "findings.csv": source,
+                     root / "state" / "remediation_status.csv": state,
+                     root / "data" / "verification_results.csv": evidence}
+            for path, content in paths.items():
+                path.write_text(content)
+            original_inputs = {path: path.read_bytes() for path in paths}
+            outputs = []
+            for run in range(2):
+                with self.subTest(run=run + 1):
+                    with patch("vulnops.ROOT", root), patch("vulnops.load_kev", return_value={"CVE-2026-1234"}):
+                        with patch("vulnops.load_epss", return_value=epss):
+                            with patch("vulnops.prioritize", wraps=vulnops.prioritize) as classify:
+                                with patch("sys.stdout", new_callable=io.StringIO):
+                                    self.assertEqual(vulnops.main(), 0)
+                    active = classify.call_args.args[0]
+                    self.assertEqual({row["asset_id"]: (row["remediation_status"], row["verification_status"])
+                                      for row in active}, {
+                        "A": ("open", "not_applicable"),
+                        "B": ("resolved", "unverified"),
+                        "C": ("resolved", "failed"),
+                    })
+                    output_path = root / "output" / "remediation_queue.csv"
+                    with output_path.open(newline="") as output:
+                        reader = csv.DictReader(output)
+                        self.assertEqual(reader.fieldnames, ["asset_id", "criticality", "cve", "internet_exposed", "owner_team",
+                                                            "kev", "epss_score", "epss_percentile", "priority", "reason", "remediation_status"])
+                        rows = list(reader)
+                    self.assertEqual([row["asset_id"] for row in rows], ["A", "B", "C"])
+                    self.assertEqual([row["priority"] for row in rows], ["P0", "P1", "P2"])
+                    self.assertEqual([row["remediation_status"] for row in rows], ["open", "resolved", "resolved"])
+                    self.assertEqual({path: path.read_bytes() for path in paths}, original_inputs)
+                    self.assertEqual(list(output_path.parent.iterdir()), [output_path])
+                    outputs.append(output_path.read_bytes())
+            self.assertEqual(outputs[0], outputs[1])
+
+    def test_active_queue_keeps_open_and_unrecorded_findings_but_excludes_verified_resolved(self):
         source = ("asset_id,criticality,cve,internet_exposed,owner_team\n"
                   "B,critical,CVE-2026-1234,true,payments-platform\n"
                   "A,critical,CVE-2026-1234,true,payments-platform\n"
@@ -122,12 +511,15 @@ class VulnOpsTests(unittest.TestCase):
         ]}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "data").mkdir()
+            (root / "data").mkdir(exist_ok=True)
+            (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\n")
+            (root / "data").mkdir(exist_ok=True)
             (root / "state").mkdir()
             input_path = root / "data" / "findings.csv"
             state_path = root / "state" / "remediation_status.csv"
             input_path.write_text(source)
             state_path.write_text(state)
+            (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\nB,CVE-2026-1234,false\n")
             original_state = state_path.read_bytes()
             original_findings = input_path.read_bytes()
             outputs = []
@@ -158,16 +550,19 @@ class VulnOpsTests(unittest.TestCase):
                     outputs.append(output_path.read_bytes())
             self.assertEqual(outputs[0], outputs[1])
 
-    def test_active_queue_is_header_only_when_every_finding_is_resolved(self):
+    def test_active_queue_is_header_only_when_every_finding_is_verified_resolved(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "data").mkdir()
+            (root / "data").mkdir(exist_ok=True)
+            (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\n")
+            (root / "data").mkdir(exist_ok=True)
             (root / "state").mkdir()
             (root / "data" / "findings.csv").write_text(
                 "asset_id,criticality,cve,internet_exposed,owner_team\n"
                 "B,critical,CVE-2026-1234,true,unknown\n")
             state_path = root / "state" / "remediation_status.csv"
             state_path.write_text("asset_id,cve,remediation_status\nB,CVE-2026-1234,resolved\n")
+            (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\nB,CVE-2026-1234,false\n")
             original_state = state_path.read_bytes()
             with patch("vulnops.ROOT", root), patch("vulnops.load_kev", return_value={"CVE-2026-1234"}):
                 with patch("vulnops.load_epss", wraps=vulnops.load_epss) as epss:
@@ -193,12 +588,15 @@ class VulnOpsTests(unittest.TestCase):
                 "CVE-2026-5678": {"epss_score": 0.99, "epss_percentile": None}}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "data").mkdir()
+            (root / "data").mkdir(exist_ok=True)
+            (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\n")
+            (root / "data").mkdir(exist_ok=True)
             (root / "state").mkdir()
             input_path = root / "data" / "findings.csv"
             state_path = root / "state" / "remediation_status.csv"
             input_path.write_text(source)
             state_path.write_text(state)
+            (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\nB,CVE-2026-1234,false\nD,CVE-2026-5678,false\n")
             original_state = state_path.read_bytes()
             findings = vulnops.load_findings(input_path)
             findings = vulnops.apply_remediation_status(findings, vulnops.load_remediation_statuses(state_path))
@@ -227,7 +625,7 @@ class VulnOpsTests(unittest.TestCase):
                 self.assertEqual(row["reason"], by_asset[row["asset_id"]]["reason"])
             self.assertEqual(state_path.read_bytes(), original_state)
 
-    def test_resolved_findings_do_not_change_active_p0_p1_or_p2_order(self):
+    def test_verified_resolved_findings_do_not_change_active_p0_p1_or_p2_order(self):
         source = ("asset_id,criticality,cve,internet_exposed,owner_team\n"
                   "C,critical,CVE-2026-10002,false,payments-platform\n"
                   "p0-first,critical,CVE-2026-10003,false,payments-platform\n"
@@ -243,7 +641,9 @@ class VulnOpsTests(unittest.TestCase):
         )}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "data").mkdir()
+            (root / "data").mkdir(exist_ok=True)
+            (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\n")
+            (root / "data").mkdir(exist_ok=True)
             (root / "state").mkdir()
             input_path = root / "data" / "findings.csv"
             input_path.write_text(source)
@@ -252,6 +652,7 @@ class VulnOpsTests(unittest.TestCase):
             state_path.write_text("asset_id,cve,remediation_status\n" +
                                   "".join(f"{row['asset_id']},{row['cve']},open\n" for row in findings) +
                                   "D,CVE-2026-10005,resolved\n")
+            (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\nD,CVE-2026-10005,false\n")
             original_state = state_path.read_bytes()
             outputs = []
             for include_resolved in (False, True):
@@ -284,8 +685,11 @@ class VulnOpsTests(unittest.TestCase):
         self.assertEqual(len(sorts), 1)
         self.assertNotIn("remediation_status", ast.dump(sorts[0]))
 
-    def test_prioritize_does_not_reference_remediation_status(self):
-        self.assertNotIn("remediation_status", inspect.getsource(vulnops.prioritize))
+    def test_prioritize_does_not_reference_lifecycle_or_verification_fields(self):
+        source = inspect.getsource(vulnops.prioritize)
+        for field in ("remediation_status", "verification_status", "vulnerability_present"):
+            with self.subTest(field=field):
+                self.assertNotIn(field, source)
 
     def test_rules_reasons_and_stable_priority_order(self):
         findings = [
@@ -421,9 +825,11 @@ class VulnOpsTests(unittest.TestCase):
                     epss = {finding["cve"]: {"epss_score": case[2], "epss_percentile": None}
                             for finding, case in zip(findings, cases_by_asset)}
                     root = Path(directory)
+                    (root / "data").mkdir(exist_ok=True)
+                    (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\n")
                     (root / "state").mkdir()
                     (root / "state" / "remediation_status.csv").write_text("asset_id,cve,remediation_status\n")
-                    (root / "data").mkdir()
+                    (root / "data").mkdir(exist_ok=True)
                     with (root / "data" / "findings.csv").open("w", newline="") as source:
                         writer = csv.DictWriter(source, fieldnames=["asset_id", "criticality", "cve",
                                                                    "internet_exposed", "owner_team"])
@@ -459,9 +865,11 @@ class VulnOpsTests(unittest.TestCase):
                 "CVE-2099-10002": {"epss_score": 0.99, "epss_percentile": 0.999}}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            (root / "data").mkdir(exist_ok=True)
+            (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\n")
             (root / "state").mkdir()
             (root / "state" / "remediation_status.csv").write_text("asset_id,cve,remediation_status\n")
-            (root / "data").mkdir()
+            (root / "data").mkdir(exist_ok=True)
             outputs = []
             for team in ("payments-platform", "unknown"):
                 with self.subTest(owner_team=team):
@@ -495,9 +903,11 @@ class VulnOpsTests(unittest.TestCase):
                 "CVE-2099-10002": {"epss_score": 0.99, "epss_percentile": 0.999}}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            (root / "data").mkdir(exist_ok=True)
+            (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\n")
             (root / "state").mkdir()
             (root / "state" / "remediation_status.csv").write_text("asset_id,cve,remediation_status\n")
-            (root / "data").mkdir()
+            (root / "data").mkdir(exist_ok=True)
             input_path = root / "data" / "findings.csv"
             input_path.write_text(source)
             findings = vulnops.load_findings(input_path)
@@ -530,9 +940,11 @@ class VulnOpsTests(unittest.TestCase):
             for is_kev in (True, False):
                 with self.subTest(owner_team=team, kev=is_kev), tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
+                    (root / "data").mkdir(exist_ok=True)
+                    (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\n")
                     (root / "state").mkdir()
                     (root / "state" / "remediation_status.csv").write_text("asset_id,cve,remediation_status\n")
-                    (root / "data").mkdir()
+                    (root / "data").mkdir(exist_ok=True)
                     source = ("asset_id,criticality,cve,internet_exposed,owner_team\n"
                               f"payments-api-01,critical,CVE-2099-10001,true,{team}\n"
                               "higher-epss,critical,CVE-2099-10002,true,identity\n"
@@ -621,9 +1033,11 @@ class VulnOpsTests(unittest.TestCase):
         ]}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            (root / "data").mkdir(exist_ok=True)
+            (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\n")
             (root / "state").mkdir()
             (root / "state" / "remediation_status.csv").write_text("asset_id,cve,remediation_status\n")
-            (root / "data").mkdir()
+            (root / "data").mkdir(exist_ok=True)
             (root / "data" / "findings.csv").write_text(source)
             responses = [io.BytesIO(json.dumps(feed).encode()) for feed in (kev, epss)]
             with patch("vulnops.ROOT", root), patch("vulnops.urlopen", side_effect=responses):
@@ -670,9 +1084,11 @@ class VulnOpsTests(unittest.TestCase):
         )}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            (root / "data").mkdir(exist_ok=True)
+            (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\n")
             (root / "state").mkdir()
             (root / "state" / "remediation_status.csv").write_text("asset_id,cve,remediation_status\n")
-            (root / "data").mkdir()
+            (root / "data").mkdir(exist_ok=True)
             input_path = root / "data" / "findings.csv"
             input_path.write_text(source)
             findings = vulnops.load_findings(input_path)
@@ -887,6 +1303,8 @@ class VulnOpsTests(unittest.TestCase):
                 for finding, case in zip(findings, cases)}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            (root / "data").mkdir(exist_ok=True)
+            (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\n")
             (root / "state").mkdir()
             (root / "state" / "remediation_status.csv").write_text("asset_id,cve,remediation_status\n")
             with patch("vulnops.ROOT", root), patch("vulnops.load_findings", return_value=findings):
@@ -922,6 +1340,8 @@ class VulnOpsTests(unittest.TestCase):
         shuffled = [findings[index] for index in [4, 2, 1, 3, 0]]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            (root / "data").mkdir(exist_ok=True)
+            (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\n")
             (root / "state").mkdir()
             (root / "state" / "remediation_status.csv").write_text("asset_id,cve,remediation_status\n")
             with patch("vulnops.ROOT", root), patch("vulnops.load_findings", return_value=shuffled):
@@ -956,9 +1376,11 @@ class VulnOpsTests(unittest.TestCase):
         for inputs, expected in cases:
             with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
+                (root / "data").mkdir(exist_ok=True)
+                (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\n")
                 (root / "state").mkdir()
                 (root / "state" / "remediation_status.csv").write_text("asset_id,cve,remediation_status\n")
-                (root / "data").mkdir()
+                (root / "data").mkdir(exist_ok=True)
                 findings = [{"asset_id": asset, "criticality": "critical",
                              "cve": f"CVE-2099-{1000 + index}", "internet_exposed": exposure, "owner_team": "unknown"}
                             for index, (asset, exposure, score) in enumerate(inputs)]
@@ -1002,9 +1424,11 @@ class VulnOpsTests(unittest.TestCase):
         for inputs, expected in cases:
             with self.subTest(inputs=inputs), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
+                (root / "data").mkdir(exist_ok=True)
+                (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\n")
                 (root / "state").mkdir()
                 (root / "state" / "remediation_status.csv").write_text("asset_id,cve,remediation_status\n")
-                (root / "data").mkdir()
+                (root / "data").mkdir(exist_ok=True)
                 findings = [{"asset_id": asset, "criticality": "critical", "cve": f"CVE-2099-{1000 + index}",
                              "internet_exposed": exposure, "owner_team": "unknown"} for index, (asset, exposure, score) in enumerate(inputs)]
                 with (root / "data" / "findings.csv").open("w", newline="") as source:
@@ -1042,6 +1466,8 @@ class VulnOpsTests(unittest.TestCase):
                 epss[cve] = {"epss_score": score, "epss_percentile": 1.0 if label == "tie-second" else 0.0}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            (root / "data").mkdir(exist_ok=True)
+            (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\n")
             (root / "state").mkdir()
             (root / "state" / "remediation_status.csv").write_text("asset_id,cve,remediation_status\n")
             with patch("vulnops.ROOT", root), patch("vulnops.load_findings", return_value=findings):
@@ -1057,7 +1483,8 @@ class VulnOpsTests(unittest.TestCase):
             for row in results:
                 original = originals[row["asset_id"]]
                 self.assertEqual(row, {**original, **epss[row["cve"]], "kev": "false", "priority": "P2",
-                                       "reason": "Rule 3: CVE is not in CISA KEV.", "remediation_status": "open"})
+                                       "reason": "Rule 3: CVE is not in CISA KEV.", "remediation_status": "open",
+                                       "verification_status": "not_applicable"})
             with (root / "output" / "remediation_queue.csv").open(newline="") as output:
                 reader = csv.DictReader(output)
                 self.assertEqual(reader.fieldnames, ["asset_id", "criticality", "cve", "internet_exposed", "owner_team",
@@ -1074,6 +1501,8 @@ class VulnOpsTests(unittest.TestCase):
                 epss = {row["cve"]: {"epss_score": scores[row["asset_id"]], "epss_percentile": None}
                         for row in findings}
                 root = Path(directory)
+                (root / "data").mkdir(exist_ok=True)
+                (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\n")
                 (root / "state").mkdir()
                 (root / "state" / "remediation_status.csv").write_text("asset_id,cve,remediation_status\n")
                 with patch("vulnops.ROOT", root), patch("vulnops.load_findings", return_value=findings):
@@ -1122,9 +1551,11 @@ class VulnOpsTests(unittest.TestCase):
         ]}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            (root / "data").mkdir(exist_ok=True)
+            (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\n")
             (root / "state").mkdir()
             (root / "state" / "remediation_status.csv").write_text("asset_id,cve,remediation_status\n")
-            (root / "data").mkdir()
+            (root / "data").mkdir(exist_ok=True)
             input_path = root / "data" / "findings.csv"
             input_path.write_text(source)
             baseline = vulnops.prioritize(vulnops.load_findings(input_path), kev_cves)
@@ -1165,9 +1596,11 @@ class VulnOpsTests(unittest.TestCase):
     def test_epss_failure_stops_run_and_preserves_existing_queue(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            (root / "data").mkdir(exist_ok=True)
+            (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\n")
             (root / "state").mkdir()
             (root / "state" / "remediation_status.csv").write_text("asset_id,cve,remediation_status\n")
-            (root / "data").mkdir()
+            (root / "data").mkdir(exist_ok=True)
             (root / "output").mkdir()
             (root / "data" / "findings.csv").write_text("asset_id,criticality,cve,internet_exposed,owner_team\nserver,critical,CVE-2021-44228,unknown,unknown\n")
             queue = root / "output" / "remediation_queue.csv"
@@ -1184,9 +1617,11 @@ class VulnOpsTests(unittest.TestCase):
     def test_failed_download_leaves_existing_queue_untouched(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            (root / "data").mkdir(exist_ok=True)
+            (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\n")
             (root / "state").mkdir()
             (root / "state" / "remediation_status.csv").write_text("asset_id,cve,remediation_status\n")
-            (root / "data").mkdir()
+            (root / "data").mkdir(exist_ok=True)
             (root / "output").mkdir()
             (root / "data" / "findings.csv").write_text("asset_id,criticality,cve,internet_exposed,owner_team\nserver,critical,CVE-2021-44228,unknown,unknown\n")
             queue = root / "output" / "remediation_queue.csv"

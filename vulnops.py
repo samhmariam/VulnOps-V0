@@ -66,12 +66,59 @@ def load_remediation_statuses(path):
     return statuses
 
 
+def load_verification_results(path):
+    """Load explicit presence evidence as booleans keyed by (asset_id, cve)."""
+    required = ("asset_id", "cve", "vulnerability_present")
+    results = {}
+    with path.open(newline="", encoding="utf-8-sig") as source:
+        reader = csv.DictReader(source)
+        columns = reader.fieldnames
+        if not columns or len(columns) != 3 or set(columns) != set(required):
+            raise ValueError("Verification CSV must contain exactly asset_id, cve, and vulnerability_present columns.")
+        for row in reader:
+            if None in row or any(value is None for value in row.values()):
+                raise ValueError(f"Verification record ending at line {reader.line_num} has the wrong number of fields.")
+            for column in required:
+                row[column] = row[column].strip()
+                if not row[column]:
+                    raise ValueError(f"Verification record ending at line {reader.line_num} has an empty {column}.")
+            row["cve"] = row["cve"].upper()
+            if row["vulnerability_present"] not in ("true", "false"):
+                raise ValueError(f"Verification record ending at line {reader.line_num} has invalid vulnerability_present; expected true or false.")
+            key = (row["asset_id"], row["cve"])
+            if key in results:
+                raise ValueError(f"Duplicate verification result for {key!r} at line {reader.line_num}.")
+            results[key] = row["vulnerability_present"] == "true"
+    return results
+
+
 def apply_remediation_status(findings, statuses):
     """Attach recorded asset/CVE state, defaulting unrecorded findings to open."""
     return [
         {**finding, "remediation_status": statuses.get((finding["asset_id"], finding["cve"]), "open")}
         for finding in findings
     ]
+
+
+def apply_verification_status(findings, verification_results):
+    """Attach verification evidence without changing the remediation claim."""
+    results = []
+    for finding in findings:
+        key = (finding["asset_id"], finding["cve"])
+        if finding["remediation_status"] == "open":
+            status = "not_applicable"
+        elif finding["remediation_status"] != "resolved":
+            raise ValueError(f"Invalid remediation_status for {key!r}; expected open or resolved.")
+        elif key not in verification_results:
+            status = "unverified"
+        elif verification_results[key] is True:
+            status = "failed"
+        elif verification_results[key] is False:
+            status = "passed"
+        else:
+            raise ValueError(f"Invalid verification evidence for {key!r}; expected a boolean.")
+        results.append({**finding, "verification_status": status})
+    return results
 
 
 def load_kev():
@@ -170,7 +217,8 @@ def write_queue(path, results):
     with path.open("w", newline="", encoding="utf-8") as destination:
         writer = csv.DictWriter(destination, fieldnames=[*REQUIRED_COLUMNS, *RESULT_COLUMNS])
         writer.writeheader()
-        writer.writerows(results)
+        writer.writerows({key: value for key, value in row.items() if key != "verification_status"}
+                         for row in results)
 
 
 def main():
@@ -178,7 +226,10 @@ def main():
         findings = load_findings(ROOT / "data" / "findings.csv")
         statuses = load_remediation_statuses(ROOT / "state" / "remediation_status.csv")
         findings = apply_remediation_status(findings, statuses)
-        findings = [finding for finding in findings if finding["remediation_status"] == "open"]
+        verification_results = load_verification_results(ROOT / "data" / "verification_results.csv")
+        findings = apply_verification_status(findings, verification_results)
+        findings = [finding for finding in findings
+                    if not (finding["remediation_status"] == "resolved" and finding["verification_status"] == "passed")]
         kev_cves = load_kev()
         cves = [finding["cve"] for finding in findings]
         epss_by_cve = load_epss(cves)
