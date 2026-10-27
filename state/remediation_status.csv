@@ -1,0 +1,3 @@
+asset_id,cve,remediation_status
+payments-api-01,CVE-2026-1234,resolved
+hr-web-01,CVE-2026-5678,open

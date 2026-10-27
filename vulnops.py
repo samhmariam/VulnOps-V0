@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parent
 KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 EPSS_URL = "https://api.first.org/data/v1/epss"
 REQUIRED_COLUMNS = ("asset_id", "criticality", "cve", "internet_exposed", "owner_team")
-RESULT_COLUMNS = ("kev", "epss_score", "epss_percentile", "priority", "reason")
+RESULT_COLUMNS = ("kev", "epss_score", "epss_percentile", "priority", "reason", "remediation_status")
 
 
 def load_findings(path):
@@ -38,6 +38,40 @@ def load_findings(path):
                 raise ValueError(f"CSV record ending at line {reader.line_num} has an invalid CVE: {row['cve']}.")
             findings.append(row)
     return findings
+
+
+def load_remediation_statuses(path):
+    """Load one open/resolved status per (asset_id, cve), rejecting duplicates."""
+    required = ("asset_id", "cve", "remediation_status")
+    statuses = {}
+    with path.open(newline="", encoding="utf-8-sig") as source:
+        reader = csv.DictReader(source)
+        columns = reader.fieldnames
+        if not columns or len(columns) != 3 or set(columns) != set(required):
+            raise ValueError("Remediation state CSV must contain exactly asset_id, cve, and remediation_status columns.")
+        for row in reader:
+            if None in row or any(value is None for value in row.values()):
+                raise ValueError(f"Remediation state record ending at line {reader.line_num} has the wrong number of fields.")
+            for column in required:
+                row[column] = row[column].strip()
+                if not row[column]:
+                    raise ValueError(f"Remediation state record ending at line {reader.line_num} has an empty {column}.")
+            row["cve"] = row["cve"].upper()
+            if row["remediation_status"] not in ("open", "resolved"):
+                raise ValueError(f"Remediation state record ending at line {reader.line_num} has invalid remediation_status; expected open or resolved.")
+            key = (row["asset_id"], row["cve"])
+            if key in statuses:
+                raise ValueError(f"Duplicate remediation state for {key!r} at line {reader.line_num}.")
+            statuses[key] = row["remediation_status"]
+    return statuses
+
+
+def apply_remediation_status(findings, statuses):
+    """Attach recorded asset/CVE state, defaulting unrecorded findings to open."""
+    return [
+        {**finding, "remediation_status": statuses.get((finding["asset_id"], finding["cve"]), "open")}
+        for finding in findings
+    ]
 
 
 def load_kev():
@@ -142,6 +176,9 @@ def write_queue(path, results):
 def main():
     try:
         findings = load_findings(ROOT / "data" / "findings.csv")
+        statuses = load_remediation_statuses(ROOT / "state" / "remediation_status.csv")
+        findings = apply_remediation_status(findings, statuses)
+        findings = [finding for finding in findings if finding["remediation_status"] == "open"]
         kev_cves = load_kev()
         cves = [finding["cve"] for finding in findings]
         epss_by_cve = load_epss(cves)
