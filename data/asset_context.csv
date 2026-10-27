@@ -1,0 +1,3 @@
+defender_machine_id,asset_id,asset_criticality,internet_exposed,owner_team
+abc123,payments-api-01,critical,true,payments-platform
+def456,hr-web-01,medium,false,workplace-it

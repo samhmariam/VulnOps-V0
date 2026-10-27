@@ -3,17 +3,741 @@ import csv
 import inspect
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
+import traceback
 import unittest
 from unittest.mock import patch
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
 
 import vulnops
 
 
 class VulnOpsTests(unittest.TestCase):
+    def test_live_smoke_mode_reports_safe_counts_and_runs_normal_pipeline_including_zero_findings(self):
+        token = "controlled-secret-never-print"
+        for raw_count in (0, 2):
+            with self.subTest(raw_count=raw_count), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "data").mkdir()
+                (root / "state").mkdir()
+                (root / "data" / "asset_context.csv").write_text(
+                    "defender_machine_id,asset_id,asset_criticality,internet_exposed,owner_team\n"
+                    "abc123,payments-api-01,critical,true,payments-platform\n")
+                (root / "state" / "remediation_status.csv").write_text("asset_id,cve,remediation_status\n")
+                (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\n")
+                observation = {"machineId": "abc123", "cveId": "CVE-2026-1234", "severity": "Critical",
+                               "productName": "do-not-print-payload"}
+                payloads = [{"value": [observation] * raw_count},
+                            {"vulnerabilities": [{"cveID": "CVE-2026-1234"}]}]
+                if raw_count:
+                    payloads.append({"status": "OK", "status-code": 200, "total": 1, "data": [
+                        {"cve": "CVE-2026-1234", "epss": "0.01", "percentile": "0.1"}]})
+                responses = [io.BytesIO(json.dumps(payload).encode()) for payload in payloads]
+                with patch("vulnops.ROOT", root), patch.dict(os.environ, {"MDE_ACCESS_TOKEN": token}):
+                    with patch("vulnops.urlopen", side_effect=responses) as get:
+                        with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                            with patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                                self.assertEqual(vulnops.main(live_smoke=True), 0)
+                normalized_count = int(raw_count > 0)
+                self.assertEqual(stdout.getvalue().splitlines(), [
+                    "assets queried: 1", f"raw observations: {raw_count}",
+                    f"normalized findings: {normalized_count}",
+                    f"Wrote {normalized_count} findings to output/remediation_queue.csv"])
+                self.assertEqual(stderr.getvalue(), "")
+                for secret in (token, "Authorization", "Bearer", "do-not-print-payload"):
+                    self.assertNotIn(secret, stdout.getvalue() + stderr.getvalue())
+                self.assertEqual(get.call_count, len(payloads))
+                with (root / "output" / "remediation_queue.csv").open(newline="") as output:
+                    rows = list(csv.DictReader(output))
+                self.assertEqual(len(rows), normalized_count)
+                if rows:
+                    self.assertEqual(rows[0]["priority"], "P0")
+                    self.assertEqual(rows[0]["owner_team"], "payments-platform")
+                    self.assertEqual(rows[0]["remediation_status"], "open")
+
+    def test_live_smoke_rejects_missing_or_blank_token_before_reading_context_or_requesting(self):
+        for token in (None, "", "   "):
+            with self.subTest(token=token), patch.dict(os.environ, {}, clear=True):
+                if token is not None:
+                    os.environ["MDE_ACCESS_TOKEN"] = token
+                with patch("vulnops.load_asset_context") as context, patch("vulnops.urlopen") as get:
+                    with patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                        with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                            self.assertEqual(vulnops.main(live_smoke=True), 1)
+                self.assertIn("non-empty MDE_ACCESS_TOKEN", stderr.getvalue())
+                self.assertEqual(stdout.getvalue(), "")
+                context.assert_not_called()
+                get.assert_not_called()
+
+    def test_live_smoke_does_not_report_success_when_later_pipeline_stage_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "data").mkdir()
+            (root / "state").mkdir()
+            (root / "output").mkdir()
+            (root / "data" / "asset_context.csv").write_text(
+                "defender_machine_id,asset_id,asset_criticality,internet_exposed,owner_team\n"
+                "abc123,payments-api-01,critical,true,payments-platform\n")
+            (root / "state" / "remediation_status.csv").write_text("asset_id,cve,remediation_status\n")
+            (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\n")
+            queue = root / "output" / "remediation_queue.csv"
+            queue.write_text("previous queue\n")
+            with patch("vulnops.ROOT", root), patch.dict(os.environ, {"MDE_ACCESS_TOKEN": "controlled-test-token"}):
+                with patch("vulnops.urlopen", side_effect=[io.BytesIO(b'{"value": []}'), URLError("controlled KEV outage")]):
+                    with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                        with patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                            self.assertEqual(vulnops.main(live_smoke=True), 1)
+            self.assertNotIn("Wrote", stdout.getvalue())
+            self.assertIn("VulnOps failed", stderr.getvalue())
+            self.assertEqual(queue.read_text(), "previous queue\n")
+
+    def test_scanner_and_equivalent_csv_findings_have_identical_downstream_results(self):
+        cve = "CVE-2026-1234"  # Valid stand-in for the request's CVE-X.
+        observation = {"defender_machine_id": "abc123", "cve": cve, "severity": "critical"}
+        context = {"abc123": {"asset_id": "payments-api-01", "asset_criticality": "critical",
+                              "internet_exposed": "true", "owner_team": "payments-platform"}}
+        scanner_finding = vulnops.build_findings([observation], context)[0]
+        peers = [{"asset_id": asset, "cve": peer_cve, "severity": "critical", "criticality": criticality,
+                  "internet_exposed": exposure, "owner_team": "identity"}
+                 for asset, peer_cve, criticality, exposure in (
+                     ("false", "CVE-2026-2001", "critical", "false"),
+                     ("unknown", "CVE-2026-2002", "critical", "unknown"),
+                     ("low", "CVE-2026-2003", "critical", "true"),
+                     ("high", "CVE-2026-2004", "critical", "true"),
+                     ("p1", "CVE-2026-9999", "medium", "false"),
+                     ("p0", "CVE-2026-9999", "critical", "false"))]
+        lifecycle_cases = [(None, None, "open", "not_applicable", True),
+                           ("open", False, "open", "not_applicable", True),
+                           ("resolved", None, "resolved", "unverified", True),
+                           ("resolved", True, "resolved", "failed", True),
+                           ("resolved", False, "resolved", "passed", False)]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "data").mkdir()
+            (root / "state").mkdir()
+            fixture = root / "data" / "finding_fixture.csv"
+            with fixture.open("w", newline="") as output:
+                writer = csv.DictWriter(output, fieldnames=list(scanner_finding))
+                writer.writeheader()
+                writer.writerow({"asset_id": "payments-api-01", "cve": cve, "severity": "critical",
+                                 "criticality": "critical", "internet_exposed": "true", "owner_team": "payments-platform"})
+                writer.writerows(peers)
+            csv_findings = self.read_fixture_findings(fixture)
+            self.assertEqual(scanner_finding, csv_findings[0])
+            for in_kev in (True, False):
+                for score, percentile in ((0.75, 0.98), (0.0, 0.0), (None, None)):
+                    for claim, present, remediation, verification, active in lifecycle_cases:
+                        with self.subTest(kev=in_kev, score=score, claim=claim, present=present):
+                            (root / "state" / "remediation_status.csv").write_text(
+                                "asset_id,cve,remediation_status\n" +
+                                (f"payments-api-01,{cve},{claim}\n" if claim else ""))
+                            (root / "data" / "verification_results.csv").write_text(
+                                "asset_id,cve,vulnerability_present\n" +
+                                (f"payments-api-01,{cve},{str(present).lower()}\n" if present is not None else ""))
+                            kev = {"CVE-2026-9999"} | ({cve} if in_kev else set())
+                            epss = {peer["cve"]: {"epss_score": 0.99, "epss_percentile": 0.9} for peer in peers}
+                            epss["CVE-2026-2003"] = {"epss_score": 0.1, "epss_percentile": 0.2}
+                            epss[cve] = {"epss_score": score, "epss_percentile": percentile}
+                            snapshots = []
+                            for source in ("csv", "scanner"):
+                                initial = csv_findings if source == "csv" else [scanner_finding, *peers]
+                                with patch("vulnops.ROOT", root), patch("vulnops.load_asset_context", return_value=context):
+                                    with patch("vulnops.load_defender_findings", return_value=[observation]):
+                                        with patch("vulnops.build_findings", return_value=initial):
+                                            with patch("vulnops.load_kev", return_value=kev) as load_kev:
+                                                with patch("vulnops.load_epss", return_value=epss) as load_epss:
+                                                    with patch("vulnops.apply_verification_status", wraps=vulnops.apply_verification_status) as verify:
+                                                        with patch("vulnops.write_queue", wraps=vulnops.write_queue) as write:
+                                                            with patch("sys.stdout", new_callable=io.StringIO):
+                                                                self.assertEqual(vulnops.main(), 0)
+                                load_kev.assert_called_once_with()
+                                derived = vulnops.apply_verification_status(*verify.call_args.args)
+                                target = derived[0]
+                                self.assertEqual(target["remediation_status"], remediation)
+                                self.assertEqual(target["verification_status"], verification)
+                                classified = vulnops.prioritize(vulnops.enrich_with_epss([target], epss), kev)[0]
+                                self.assertEqual(classified["priority"], "P0" if in_kev else "P2")
+                                self.assertEqual(classified["kev"], str(in_kev).lower())
+                                self.assertEqual(classified["epss_score"], score)
+                                self.assertEqual(classified["epss_percentile"], percentile)
+                                self.assertEqual(classified["owner_team"], "payments-platform")
+                                self.assertEqual(classified["reason"],
+                                                 "Rule 1: CVE is in CISA KEV and asset criticality is critical." if in_kev
+                                                 else "Rule 3: CVE is not in CISA KEV.")
+                                queue = write.call_args.args[1]
+                                self.assertEqual(any(row["asset_id"] == "payments-api-01" for row in queue), active)
+                                p2 = [row["asset_id"] for row in queue if row["priority"] == "P2"]
+                                expected = ["high", "low", "unknown", "false"]
+                                if active and not in_kev:
+                                    expected.insert(1 if score == 0.75 else 2, "payments-api-01")
+                                self.assertEqual(p2, expected)
+                                snapshots.append((derived, classified, queue, load_epss.call_args,
+                                                  (root / "output" / "remediation_queue.csv").read_bytes()))
+                            self.assertEqual(snapshots[0], snapshots[1])
+
+    def test_priority_logic_contains_no_scanner_specific_references(self):
+        source = inspect.getsource(vulnops.prioritize).lower()
+        for term in ("defender", "machineid", "mde", "microsoft"):
+            with self.subTest(term=term):
+                self.assertNotIn(term, source)
+
+    def test_ranking_contains_no_scanner_specific_logic(self):
+        tree = ast.parse(inspect.getsource(vulnops.main))
+        # Inspect the actual ranking statements, excluding the acquisition boundary in main().
+        ranking = [node for node in ast.walk(tree)
+                   if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "sort"]
+        ranking += [node for node in ast.walk(tree) if isinstance(node, ast.ListComp)]
+        self.assertTrue(ranking)
+        for node in ranking:
+            for term in ("defender", "machineid", "mde", "microsoft"):
+                with self.subTest(term=term, expression=ast.unparse(node)):
+                    self.assertNotIn(term, ast.unparse(node).lower())
+
+    def test_main_uses_defender_without_findings_csv_and_preserves_v07_behaviour(self):
+        assets = [("machine-a", "passed", "critical", "false", "identity", "CVE-2026-1234"),
+                  ("machine-b", "failed", "critical", "false", "payments-platform", "CVE-2026-1234"),
+                  ("machine-c", "p1", "medium", "false", "identity", "CVE-2026-1234"),
+                  ("machine-d", "unverified", "low", "true", "unknown", "CVE-2026-1235"),
+                  ("machine-e", "unknown-exposure", "critical", "unknown", "data-platform", "CVE-2026-1236"),
+                  ("machine-f", "non-exposed", "critical", "false", "workplace-it", "CVE-2026-1237")]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "data").mkdir()
+            (root / "state").mkdir()
+            context_path = root / "data" / "asset_context.csv"
+            context_path.write_text("defender_machine_id,asset_id,asset_criticality,internet_exposed,owner_team\n" +
+                                    "".join(",".join(asset[:5]) + "\n" for asset in assets))
+            state_path = root / "state" / "remediation_status.csv"
+            state_path.write_text("asset_id,cve,remediation_status\n"
+                                  "passed,CVE-2026-1234,resolved\nfailed,CVE-2026-1234,resolved\n"
+                                  "unverified,CVE-2026-1235,resolved\n")
+            evidence_path = root / "data" / "verification_results.csv"
+            evidence_path.write_text("asset_id,cve,vulnerability_present\n"
+                                     "passed,CVE-2026-1234,false\nfailed,CVE-2026-1234,true\n")
+            originals = {path: path.read_bytes() for path in (context_path, state_path, evidence_path)}
+            payloads = [{"value": [{"machineId": asset[0], "cveId": asset[5], "severity": "High",
+                                    "productName": "ignored", "id": "ignored"}]} for asset in assets]
+            payloads += [{"vulnerabilities": [{"cveID": "CVE-2026-1234"}]},
+                         {"status": "OK", "status-code": 200, "total": 4, "data": [
+                             {"cve": cve, "epss": score, "percentile": "0.9"}
+                             for cve, score in (("CVE-2026-1234", "0.001"), ("CVE-2026-1235", "0.01"),
+                                                ("CVE-2026-1236", "0.99"), ("CVE-2026-1237", "0.99"))]}]
+            outputs = []
+            for run in range(2):
+                with self.subTest(run=run):
+                    responses = [io.BytesIO(json.dumps(payload).encode()) for payload in payloads]
+                    with patch("vulnops.ROOT", root), patch.dict(os.environ, {"MDE_ACCESS_TOKEN": "controlled-test-token"}):
+                        with patch("vulnops.urlopen", side_effect=responses) as get:
+                            with patch("vulnops.write_queue", wraps=vulnops.write_queue) as write:
+                                with patch("sys.stdout", new_callable=io.StringIO):
+                                    self.assertEqual(vulnops.main(), 0)
+                    self.assertEqual(get.call_count, 8)
+                    for asset, call in zip(assets, get.call_args_list[:6]):
+                        self.assertEqual(parse_qs(urlparse(call.args[0].full_url).query)["$filter"],
+                                         [f"machineId eq '{asset[0]}'"])
+                    internal = write.call_args.args[1]
+                    self.assertEqual([row["asset_id"] for row in internal],
+                                     ["failed", "p1", "unverified", "unknown-exposure", "non-exposed"])
+                    self.assertEqual([row["verification_status"] for row in internal],
+                                     ["failed", "not_applicable", "unverified", "not_applicable", "not_applicable"])
+                    self.assertTrue(all(row["severity"] == "high" for row in internal))
+                    self.assertTrue(all("defender_machine_id" not in row and "productName" not in row for row in internal))
+                    output_path = root / "output" / "remediation_queue.csv"
+                    with output_path.open(newline="") as output:
+                        reader = csv.DictReader(output)
+                        self.assertEqual(reader.fieldnames, ["asset_id", "criticality", "cve", "internet_exposed",
+                                                            "owner_team", "kev", "epss_score", "epss_percentile",
+                                                            "priority", "reason", "remediation_status"])
+                        rows = list(reader)
+                    self.assertEqual([row["priority"] for row in rows], ["P0", "P1", "P2", "P2", "P2"])
+                    self.assertEqual([row["remediation_status"] for row in rows], ["resolved", "open", "resolved", "open", "open"])
+                    self.assertEqual([row["owner_team"] for row in rows],
+                                     ["payments-platform", "identity", "unknown", "data-platform", "workplace-it"])
+                    self.assertEqual(rows[0]["reason"], "Rule 1: CVE is in CISA KEV and asset criticality is critical.")
+                    self.assertTrue(all(row["reason"] == "Rule 3: CVE is not in CISA KEV." for row in rows[2:]))
+                    self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+                    self.assertFalse((root / "data" / "findings.csv").exists())
+                    outputs.append(output_path.read_bytes())
+            self.assertEqual(outputs[0], outputs[1])
+            self.assertFalse(hasattr(vulnops, "load_findings"))
+
+    def test_main_defender_failure_preserves_previous_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "data").mkdir()
+            (root / "output").mkdir()
+            (root / "data" / "asset_context.csv").write_text(
+                "defender_machine_id,asset_id,asset_criticality,internet_exposed,owner_team\n"
+                "abc123,payments-api-01,critical,true,payments-platform\n")
+            output_path = root / "output" / "remediation_queue.csv"
+            output_path.write_text("previous queue\n")
+            error = HTTPError(vulnops.DEFENDER_URL, 401, "controlled-secret", {}, None)
+            with patch("vulnops.ROOT", root), patch.dict(os.environ, {"MDE_ACCESS_TOKEN": "controlled-secret"}):
+                with patch("vulnops.urlopen", side_effect=error) as get:
+                    with patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                        self.assertEqual(vulnops.main(), 1)
+            get.assert_called_once()
+            self.assertIn("Defender authentication failure", stderr.getvalue())
+            self.assertNotIn("controlled-secret", stderr.getvalue())
+            self.assertEqual(output_path.read_text(), "previous queue\n")
+
+    def read_fixture_findings(self, path):
+        """Read inline test data; this is not a production ingestion path."""
+        with path.open(newline="") as source:
+            rows = [{key: value.strip() for key, value in row.items()} for row in csv.DictReader(source)]
+        for row in rows:
+            row["cve"] = row["cve"].upper()
+            row["criticality"] = row["criticality"].lower()
+        return rows
+
+    def run_fixture_main(self):
+        """Supply deterministic findings at the acquisition boundary for policy regressions."""
+        findings = self.read_fixture_findings(vulnops.ROOT / "data" / "finding_fixture.csv")
+        with patch("vulnops.load_asset_context", return_value={}):
+            with patch("vulnops.load_defender_findings", return_value=[]):
+                with patch("vulnops.build_findings", return_value=findings):
+                    return vulnops.main()
+
+    def test_build_findings_joins_csv_context_using_existing_internal_field_names(self):
+        observations = [{"defender_machine_id": "abc123", "cve": "CVE-2026-1234", "severity": "low"}]
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "asset_context.csv"
+            source.write_text("defender_machine_id,asset_id,asset_criticality,internet_exposed,owner_team\n"
+                              "abc123,payments-api-01,critical,true,payments-platform\n")
+            context = vulnops.load_asset_context(source)
+        results = vulnops.build_findings(observations, context)
+        self.assertEqual(results, [{"asset_id": "payments-api-01", "cve": "CVE-2026-1234", "severity": "low",
+                                    "criticality": "critical", "internet_exposed": "true", "owner_team": "payments-platform"}])
+        self.assertEqual(observations, [{"defender_machine_id": "abc123", "cve": "CVE-2026-1234", "severity": "low"}])
+        self.assertEqual(context["abc123"], {"asset_id": "payments-api-01", "asset_criticality": "critical",
+                                            "internet_exposed": "true", "owner_team": "payments-platform"})
+        self.assertIsNot(results[0], observations[0])
+        self.assertIsNot(results[0], context["abc123"])
+
+    def test_build_findings_keeps_vendor_fields_out_of_existing_downstream_stages(self):
+        observation = {"defender_machine_id": "abc123", "cve": "CVE-2026-1234", "severity": "low",
+                       "machineId": "abc123", "cveId": "CVE-2026-1234", "id": "vendor-id",
+                       "productName": "product", "productVersion": "1", "productVendor": "vendor", "fixingKbId": "KB123"}
+        context = {"abc123": {"asset_id": "payments-api-01", "asset_criticality": "critical",
+                              "internet_exposed": "unknown", "owner_team": "unknown", "defender_machine_id": "abc123"}}
+        findings = vulnops.build_findings([observation], context)
+        expected_fields = {"asset_id", "cve", "severity", "criticality", "internet_exposed", "owner_team"}
+        self.assertEqual(set(findings[0]), expected_fields)
+        key = ("payments-api-01", "CVE-2026-1234")
+        findings = vulnops.apply_remediation_status(findings, {key: "resolved"})
+        findings = vulnops.apply_verification_status(findings, {key: True})
+        findings = vulnops.enrich_with_epss(findings, {key[1]: {"epss_score": 0.01, "epss_percentile": 0.1}})
+        findings = vulnops.prioritize(findings, {key[1]})
+        result = findings[0]
+        self.assertEqual(result["priority"], "P0")
+        self.assertEqual(result["remediation_status"], "resolved")
+        self.assertEqual(result["verification_status"], "failed")
+        self.assertEqual(result["owner_team"], "unknown")
+        self.assertEqual(result["internet_exposed"], "unknown")
+        self.assertEqual(set(result), expected_fields | {"remediation_status", "verification_status", "epss_score",
+                                                       "epss_percentile", "kev", "priority", "reason"})
+
+    def test_build_findings_rejects_missing_context_without_inventing_values(self):
+        observations = [{"defender_machine_id": "unconfigured", "cve": "CVE-2026-1234", "severity": "high"}]
+        with self.assertRaisesRegex(ValueError, "no matching asset context"):
+            vulnops.build_findings(observations, {})
+
+    def test_build_findings_preserves_order_and_reuses_context_for_multiple_cves(self):
+        context = {"abc123": {"asset_id": "payments-api-01", "asset_criticality": "critical",
+                              "internet_exposed": "true", "owner_team": "payments-platform"},
+                   "def456": {"asset_id": "hr-web-01", "asset_criticality": "medium",
+                              "internet_exposed": "false", "owner_team": "workplace-it"}}
+        observations = [{"defender_machine_id": machine, "cve": cve, "severity": "high"}
+                        for machine, cve in (("abc123", "CVE-2026-1234"), ("def456", "CVE-2026-1234"),
+                                             ("abc123", "CVE-2026-5678"))]
+        findings = vulnops.build_findings(observations, context)
+        self.assertEqual([(row["asset_id"], row["cve"]) for row in findings],
+                         [("payments-api-01", "CVE-2026-1234"), ("hr-web-01", "CVE-2026-1234"),
+                          ("payments-api-01", "CVE-2026-5678")])
+        self.assertEqual(vulnops.build_findings([], context), [])
+
+    def test_normalize_defender_single_observation_keeps_only_scanner_fields(self):
+        entry = {"machineId": "abc123", "cveId": "CVE-2026-1234", "severity": "Critical",
+                 "productName": "product", "productVersion": "1", "productVendor": "vendor",
+                 "fixingKbId": "KB123", "id": "defender-finding-id"}
+        original = entry.copy()
+        self.assertEqual(vulnops.normalize_defender_findings([entry]), [
+            {"defender_machine_id": "abc123", "cve": "CVE-2026-1234", "severity": "critical"}])
+        self.assertEqual(entry, original)
+
+    def test_normalize_defender_collapses_exact_and_different_software_duplicates(self):
+        entry = {"machineId": "abc123", "cveId": "CVE-2026-1234", "severity": "High"}
+        for duplicate in (entry.copy(), {**entry, "productName": "another-product", "productVersion": "2",
+                                         "productVendor": "another-vendor", "id": "different-id"},
+                          {**entry, "machineId": " abc123 ", "cveId": " cve-2026-1234 ", "severity": "high"}):
+            with self.subTest(duplicate=duplicate):
+                self.assertEqual(vulnops.normalize_defender_findings([entry, duplicate]), [
+                    {"defender_machine_id": "abc123", "cve": "CVE-2026-1234", "severity": "high"}])
+
+    def test_normalize_defender_fails_on_conflicting_severity_in_either_order(self):
+        high = {"machineId": "abc123", "cveId": "CVE-2026-1234", "severity": "High"}
+        low = {**high, "severity": "Low"}
+        for entries in ([high, low], [low, high]):
+            with self.subTest(entries=entries):
+                with self.assertRaisesRegex(ValueError, "conflicting severity.*same machine/CVE"):
+                    vulnops.normalize_defender_findings(entries)
+
+    def test_normalize_defender_rejects_missing_fields_and_unknown_severity(self):
+        entry = {"machineId": "abc123", "cveId": "CVE-2026-1234", "severity": "High"}
+        for field in entry:
+            for value in (None, "", "   "):
+                with self.subTest(field=field, value=value):
+                    invalid = {key: item for key, item in entry.items() if key != field}
+                    if value is not None:
+                        invalid[field] = value
+                    with self.assertRaisesRegex(ValueError, "requires non-empty"):
+                        vulnops.normalize_defender_findings([invalid])
+        with self.assertRaisesRegex(ValueError, "unexpected severity"):
+            vulnops.normalize_defender_findings([{**entry, "severity": "unknown"}])
+
+    def test_normalize_defender_preserves_distinct_keys_and_first_occurrence_order(self):
+        a = {"machineId": "abc123", "cveId": "CVE-2026-1234", "severity": "High"}
+        b = {**a, "machineId": "def456"}
+        c = {**a, "cveId": "CVE-2026-5678"}
+        results = vulnops.normalize_defender_findings([a, b, a, c, b])
+        self.assertEqual([(row["defender_machine_id"], row["cve"]) for row in results],
+                         [("abc123", "CVE-2026-1234"), ("def456", "CVE-2026-1234"), ("abc123", "CVE-2026-5678")])
+        self.assertEqual(vulnops.normalize_defender_findings([]), [])
+
+    def test_defender_deduplicates_across_pages_and_rejects_cross_page_conflicts(self):
+        entry = {"machineId": "abc123", "cveId": "CVE-2026-1234", "severity": "High"}
+        for severity in ("high", "Low"):
+            with self.subTest(severity=severity):
+                responses = [io.BytesIO(json.dumps({"value": [entry] * 10000}).encode()),
+                             io.BytesIO(json.dumps({"value": [{**entry, "severity": severity}]}).encode())]
+                with patch.dict(os.environ, {"MDE_ACCESS_TOKEN": "controlled-test-token"}):
+                    with patch("vulnops.urlopen", side_effect=responses) as get:
+                        if severity == "Low":
+                            with self.assertRaisesRegex(ValueError, "conflicting severity"):
+                                vulnops.load_defender_findings({"abc123": {}})
+                        else:
+                            self.assertEqual(vulnops.load_defender_findings({"abc123": {}}), [
+                                {"defender_machine_id": "abc123", "cve": "CVE-2026-1234", "severity": "high"}])
+                self.assertEqual(get.call_count, 2)
+
+    def test_defender_paginates_until_a_page_has_fewer_than_10000_rows(self):
+        for page_sizes in ((0,), (1,), (9999,), (10000, 0), (10000, 500)):
+            with self.subTest(page_sizes=page_sizes):
+                responses = [io.BytesIO(json.dumps({"value": [
+                    {"machineId": "abc123", "cveId": f"CVE-2026-{1000 + page * 10000 + index}", "severity": "High"}
+                    for index in range(size)]}).encode()) for page, size in enumerate(page_sizes)]
+                with patch.dict(os.environ, {"MDE_ACCESS_TOKEN": "controlled-test-token"}):
+                    with patch("vulnops.urlopen", side_effect=responses) as get:
+                        findings = vulnops.load_defender_findings({"abc123": {}})
+                self.assertEqual(get.call_count, len(page_sizes))
+                self.assertEqual(len(findings), sum(page_sizes))
+                offset = 0
+                for page, (size, call) in enumerate(zip(page_sizes, get.call_args_list)):
+                    self.assertEqual(parse_qs(urlparse(call.args[0].full_url).query), {
+                        "$filter": ["machineId eq 'abc123'"], "$top": ["10000"], "$skip": [str(page * 10000)]})
+                    self.assertEqual(call.args[0].get_header("Authorization"), "Bearer controlled-test-token")
+                    self.assertEqual(findings[offset:offset + size], [
+                        {"defender_machine_id": "abc123", "cve": f"CVE-2026-{1000 + page * 10000 + index}", "severity": "high"}
+                        for index in range(size)])
+                    offset += size
+
+    def test_defender_fails_instead_of_truncating_after_10_full_pages(self):
+        full_page = json.dumps({"value": [
+            {"machineId": "abc123", "cveId": "CVE-2026-1234", "severity": "High"}
+        ] * 10000}).encode()
+        responses = [io.BytesIO(full_page) for _ in range(10)]
+        with patch.dict(os.environ, {"MDE_ACCESS_TOKEN": "controlled-test-token"}):
+            with patch("vulnops.urlopen", side_effect=responses) as get:
+                with self.assertRaisesRegex(ValueError, "maximum 10 pages per machine.*refusing to truncate"):
+                    vulnops.load_defender_findings({"abc123": {}})
+        self.assertEqual(get.call_count, 10)
+        self.assertEqual([parse_qs(urlparse(call.args[0].full_url).query)["$skip"]
+                          for call in get.call_args_list], [[str(page * 10000)] for page in range(10)])
+
+    def test_defender_allows_a_short_tenth_page_and_resets_skip_for_next_machine(self):
+        full_page = json.dumps({"value": [
+            {"machineId": "abc123", "cveId": "CVE-2026-1234", "severity": "High"}
+        ] * 10000}).encode()
+        responses = [io.BytesIO(full_page) for _ in range(9)]
+        responses += [io.BytesIO(b'{"value": []}'), io.BytesIO(b'{"value": []}')]
+        with patch.dict(os.environ, {"MDE_ACCESS_TOKEN": "controlled-test-token"}):
+            with patch("vulnops.urlopen", side_effect=responses) as get:
+                findings = vulnops.load_defender_findings({"abc123": {}, "def456": {}})
+        self.assertEqual(findings, [{"defender_machine_id": "abc123", "cve": "CVE-2026-1234", "severity": "high"}])
+        self.assertEqual(get.call_count, 11)
+        self.assertEqual(parse_qs(urlparse(get.call_args_list[9].args[0].full_url).query), {
+            "$filter": ["machineId eq 'abc123'"], "$top": ["10000"], "$skip": ["90000"]})
+        self.assertEqual(parse_qs(urlparse(get.call_args_list[10].args[0].full_url).query), {
+            "$filter": ["machineId eq 'def456'"], "$top": ["10000"], "$skip": ["0"]})
+
+    def test_defender_page_failure_does_not_return_partial_findings(self):
+        full_page = io.BytesIO(json.dumps({"value": [
+            {"machineId": "abc123", "cveId": "CVE-2026-1234", "severity": "High"}
+        ] * 10000}).encode())
+        with patch.dict(os.environ, {"MDE_ACCESS_TOKEN": "controlled-test-token"}):
+            with patch("vulnops.urlopen", side_effect=[full_page, URLError("network unavailable")]) as get:
+                with self.assertRaisesRegex(ValueError, "Defender network retrieval failed"):
+                    vulnops.load_defender_findings({"abc123": {}})
+        self.assertEqual(get.call_count, 2)
+
+    def test_defender_queries_only_machines_configured_in_asset_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "asset_context.csv"
+            source.write_text("defender_machine_id,asset_id,asset_criticality,internet_exposed,owner_team\n"
+                              "abc123,payments-api-01,critical,true,payments-platform\n"
+                              "def456,hr-web-01,medium,false,workplace-it\n")
+            context = vulnops.load_asset_context(source)
+            responses = [io.BytesIO(json.dumps({"value": [
+                {"machineId": machine, "cveId": "CVE-2026-1234", "severity": "High"}]}).encode())
+                         for machine in ("abc123", "def456")]
+            with patch.dict(os.environ, {"MDE_ACCESS_TOKEN": "controlled-test-token"}):
+                with patch("vulnops.urlopen", side_effect=responses) as get:
+                    findings = vulnops.load_defender_findings(context)
+        self.assertEqual(get.call_count, 2)
+        filters = [parse_qs(urlparse(call.args[0].full_url).query) for call in get.call_args_list]
+        self.assertEqual(filters, [{"$filter": ["machineId eq 'abc123'"], "$top": ["10000"], "$skip": ["0"]},
+                                   {"$filter": ["machineId eq 'def456'"], "$top": ["10000"], "$skip": ["0"]}])
+        self.assertEqual([row["defender_machine_id"] for row in findings], ["abc123", "def456"])
+        self.assertNotIn("unconfigured-machine", str(filters))
+
+    def test_defender_rejects_21_configured_assets_before_retrieval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "asset_context.csv"
+            source.write_text("defender_machine_id,asset_id,asset_criticality,internet_exposed,owner_team\n" +
+                              "".join(f"machine-{i},asset-{i},low,unknown,unknown\n" for i in range(21)))
+            context = vulnops.load_asset_context(source)
+            with patch.dict(os.environ, {}, clear=True), patch("vulnops.urlopen") as get:
+                with self.assertRaisesRegex(ValueError, "V0.8.*pilot.*20 assets.*bulk ingestion.*not yet"):
+                    vulnops.load_defender_findings(context)
+                get.assert_not_called()
+
+    def test_defender_accepts_20_configured_assets(self):
+        context = {f"machine-{i}": {} for i in range(20)}
+        responses = [io.BytesIO(b'{"value": []}') for _ in context]
+        with patch.dict(os.environ, {"MDE_ACCESS_TOKEN": "controlled-test-token"}):
+            with patch("vulnops.urlopen", side_effect=responses) as get:
+                self.assertEqual(vulnops.load_defender_findings(context), [])
+        self.assertEqual(get.call_count, 20)
+
+    def test_defender_empty_pilot_scope_makes_no_request(self):
+        with patch.dict(os.environ, {}, clear=True), patch("vulnops.urlopen") as get:
+            self.assertEqual(vulnops.load_defender_findings({}), [])
+            get.assert_not_called()
+
+    def test_defender_filter_encodes_reserved_characters_and_escapes_odata_quotes(self):
+        machine = "machine' &/+#?"
+        with patch.dict(os.environ, {"MDE_ACCESS_TOKEN": "controlled-test-token"}):
+            with patch("vulnops.urlopen", return_value=io.BytesIO(b'{"value": []}')) as get:
+                self.assertEqual(vulnops.load_defender_findings({machine: {}}), [])
+        url = urlparse(get.call_args.args[0].full_url)
+        self.assertEqual(url.fragment, "")
+        self.assertEqual(parse_qs(url.query), {"$filter": ["machineId eq 'machine'' &/+#?'"], "$top": ["10000"], "$skip": ["0"]})
+
+    def test_defender_rejects_results_outside_requested_machine_even_if_configured(self):
+        for returned_machine in ("unconfigured-machine", "def456"):
+            with self.subTest(returned_machine=returned_machine):
+                payload = {"value": [{"machineId": returned_machine, "cveId": "CVE-2026-1234", "severity": "High"}]}
+                with patch.dict(os.environ, {"MDE_ACCESS_TOKEN": "controlled-test-token"}):
+                    with patch("vulnops.urlopen", return_value=io.BytesIO(json.dumps(payload).encode())) as get:
+                        with self.assertRaisesRegex(ValueError, "outside.*pilot machine scope"):
+                            vulnops.load_defender_findings({"abc123": {}, "def456": {}})
+                get.assert_called_once()
+
+    def test_defender_loads_one_observation_with_bearer_auth_and_discards_unused_fields(self):
+        payload = {"value": [{"machineId": "abc123", "cveId": "CVE-2026-1234", "severity": "Critical",
+                              "id": "unused", "fixingKbId": None, "productName": "unused",
+                              "productVendor": "unused", "productVersion": "unused"}]}
+        with patch.dict(os.environ, {"MDE_ACCESS_TOKEN": "controlled-test-token"}):
+            with patch("vulnops.urlopen", return_value=io.BytesIO(json.dumps(payload).encode())) as get:
+                self.assertEqual(vulnops.load_defender_findings({"abc123": {}}), [
+                    {"defender_machine_id": "abc123", "cve": "CVE-2026-1234", "severity": "critical"}])
+        get.assert_called_once()
+        request = get.call_args.args[0]
+        self.assertEqual(request.full_url.split("?")[0], vulnops.DEFENDER_URL)
+        self.assertEqual(parse_qs(urlparse(request.full_url).query), {"$filter": ["machineId eq 'abc123'"], "$top": ["10000"], "$skip": ["0"]})
+        self.assertEqual(request.get_method(), "GET")
+        self.assertEqual(request.get_header("Authorization"), "Bearer controlled-test-token")
+        self.assertEqual(get.call_args.kwargs, {"timeout": 30})
+
+    def test_defender_accepts_empty_value_list(self):
+        with patch.dict(os.environ, {"MDE_ACCESS_TOKEN": "controlled-test-token"}):
+            with patch("vulnops.urlopen", return_value=io.BytesIO(b'{"value": []}')):
+                self.assertEqual(vulnops.load_defender_findings({"abc123": {}}), [])
+
+    def test_defender_rejects_missing_or_blank_token_without_network_request(self):
+        for token in (None, "", "   "):
+            with self.subTest(token=token), patch.dict(os.environ, {}, clear=True):
+                if token is not None:
+                    os.environ["MDE_ACCESS_TOKEN"] = token
+                with patch("vulnops.urlopen") as get:
+                    with self.assertRaisesRegex(ValueError, "non-empty MDE_ACCESS_TOKEN"):
+                        vulnops.load_defender_findings({"abc123": {}})
+                    get.assert_not_called()
+
+    def test_defender_http_failures_are_clear_and_do_not_expose_token(self):
+        cases = [(401, "authentication failure"), (403, "authorization/permission failure"),
+                 (429, "rate limiting"), (500, "service failure"), (503, "service failure"),
+                 (400, "unexpected HTTP response")]
+        token = "controlled-secret-not-for-errors"
+        for code, message in cases:
+            with self.subTest(code=code), patch.dict(os.environ, {"MDE_ACCESS_TOKEN": token}):
+                error = HTTPError(vulnops.DEFENDER_URL, code, token, {}, None)
+                with patch("vulnops.urlopen", side_effect=error) as get:
+                    with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                        with patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                            with self.assertRaisesRegex(ValueError, message) as caught:
+                                vulnops.load_defender_findings({"abc123": {}})
+                get.assert_called_once()
+                self.assertNotIn(token, "".join(traceback.format_exception(caught.exception)))
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(stderr.getvalue(), "")
+
+    def test_defender_network_failure_does_not_return_empty_or_expose_token(self):
+        token = "controlled-secret-not-for-errors"
+        for error in (URLError(token), TimeoutError(token), ValueError(token)):
+            with self.subTest(error_type=type(error)), patch.dict(os.environ, {"MDE_ACCESS_TOKEN": token}):
+                with patch("vulnops.urlopen", side_effect=error) as get:
+                    with self.assertRaisesRegex(ValueError, "Defender .*failed") as caught:
+                        vulnops.load_defender_findings({"abc123": {}})
+                get.assert_called_once()
+                self.assertNotIn(token, "".join(traceback.format_exception(caught.exception)))
+
+    def test_defender_rejects_invalid_json(self):
+        with patch.dict(os.environ, {"MDE_ACCESS_TOKEN": "controlled-test-token"}):
+            for body in (b"not json", b"", b"\xff"):
+                with self.subTest(body=body), patch("vulnops.urlopen", return_value=io.BytesIO(body)):
+                    with self.assertRaisesRegex(ValueError, "invalid JSON"):
+                        vulnops.load_defender_findings({"abc123": {}})
+
+    def test_defender_rejects_missing_value_and_invalid_response_shapes(self):
+        with patch.dict(os.environ, {"MDE_ACCESS_TOKEN": "controlled-test-token"}):
+            for payload in ({}, [], None, {"value": None}, {"value": {}}, {"value": ""}):
+                with self.subTest(payload=payload):
+                    with patch("vulnops.urlopen", return_value=io.BytesIO(json.dumps(payload).encode())):
+                        with self.assertRaisesRegex(ValueError, "Defender response.*value"):
+                            vulnops.load_defender_findings({"abc123": {}})
+
+    def test_defender_rejects_malformed_observations_and_unexpected_severity(self):
+        valid = {"machineId": "abc123", "cveId": "CVE-2026-1234", "severity": "Critical"}
+        entries = [None, {}, {**valid, "severity": "informational"}, {**valid, "cveId": "invalid"}]
+        for field in valid:
+            entries.extend({**valid, field: value} for value in (None, "", "   ", 1))
+        with patch.dict(os.environ, {"MDE_ACCESS_TOKEN": "controlled-test-token"}):
+            for entry in entries:
+                with self.subTest(entry=entry):
+                    body = json.dumps({"value": [valid, entry]}).encode()
+                    with patch("vulnops.urlopen", return_value=io.BytesIO(body)):
+                        with self.assertRaisesRegex(ValueError, "Defender observation"):
+                            vulnops.load_defender_findings({"abc123": {}})
+
+    def test_defender_normalizes_supported_severities_and_cve(self):
+        entries = [{"machineId": " abc123 ", "cveId": f" cve-2026-{1234 + index} ", "severity": severity}
+                   for index, severity in enumerate(("Critical", "High", "Medium", " Low "))]
+        with patch.dict(os.environ, {"MDE_ACCESS_TOKEN": "controlled-test-token"}):
+            with patch("vulnops.urlopen", return_value=io.BytesIO(json.dumps({"value": entries}).encode())):
+                findings = vulnops.load_defender_findings({"abc123": {}})
+        self.assertEqual([row["severity"] for row in findings], ["critical", "high", "medium", "low"])
+        for index, row in enumerate(findings):
+            self.assertEqual(row["cve"], f"CVE-2026-{1234 + index}")
+            self.assertEqual(row["defender_machine_id"], "abc123")
+
+    def test_asset_context_loads_valid_rows_and_preserves_unknown_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "asset_context.csv"
+            source.write_text("defender_machine_id,asset_id,asset_criticality,internet_exposed,owner_team\n"
+                              " abc123 , payments-api-01 , Critical ,true,payments-platform\n"
+                              "def456,hr-web-01,medium,false,workplace-it\n"
+                              "ghi789,unmapped-team-01,low,unknown,unknown\n"
+                              "jkl012,identity-01,high,true,identity\n")
+            self.assertEqual(vulnops.load_asset_context(source), {
+                "abc123": {"asset_id": "payments-api-01", "asset_criticality": "critical",
+                           "internet_exposed": "true", "owner_team": "payments-platform"},
+                "def456": {"asset_id": "hr-web-01", "asset_criticality": "medium",
+                           "internet_exposed": "false", "owner_team": "workplace-it"},
+                "ghi789": {"asset_id": "unmapped-team-01", "asset_criticality": "low",
+                           "internet_exposed": "unknown", "owner_team": "unknown"},
+                "jkl012": {"asset_id": "identity-01", "asset_criticality": "high",
+                           "internet_exposed": "true", "owner_team": "identity"},
+            })
+
+    def test_asset_context_rejects_duplicate_machine_or_asset_ids(self):
+        cases = [("abc123,other-asset,low,false,identity", "defender_machine_id"),
+                 ("abc123,payments-api-01,critical,true,payments-platform", "defender_machine_id"),
+                 ("other-machine,payments-api-01,low,false,identity", "asset_id"),
+                 (" abc123 , other-asset ,low,false,identity", "defender_machine_id"),
+                 ("other-machine, payments-api-01 ,low,false,identity", "asset_id")]
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "asset_context.csv"
+            for duplicate, field in cases:
+                with self.subTest(duplicate=duplicate):
+                    source.write_text("defender_machine_id,asset_id,asset_criticality,internet_exposed,owner_team\n"
+                                      f"abc123,payments-api-01,critical,true,payments-platform\n{duplicate}\n")
+                    with self.assertRaisesRegex(ValueError, f"Duplicate {field}"):
+                        vulnops.load_asset_context(source)
+
+    def test_asset_context_rejects_blank_required_fields(self):
+        columns = ["defender_machine_id", "asset_id", "asset_criticality", "internet_exposed", "owner_team"]
+        values = ["abc123", "payments-api-01", "critical", "true", "payments-platform"]
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "asset_context.csv"
+            for index, column in enumerate(columns):
+                for blank in ("", "   "):
+                    with self.subTest(column=column, blank=blank):
+                        row = values.copy()
+                        row[index] = blank
+                        source.write_text(",".join(columns) + "\n" + ",".join(row) + "\n")
+                        with self.assertRaisesRegex(ValueError, f"empty {column}"):
+                            vulnops.load_asset_context(source)
+
+    def test_asset_context_rejects_invalid_exposure_and_criticality(self):
+        cases = [("critical", value, "internet_exposed") for value in ("yes", "maybe", "True", "FALSE")]
+        cases += [(value, "true", "asset_criticality") for value in ("unknown", "urgent", "5")]
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "asset_context.csv"
+            for criticality, exposure, field in cases:
+                with self.subTest(criticality=criticality, exposure=exposure):
+                    source.write_text("defender_machine_id,asset_id,asset_criticality,internet_exposed,owner_team\n"
+                                      f"abc123,payments-api-01,{criticality},{exposure},payments-platform\n")
+                    with self.assertRaisesRegex(ValueError, f"invalid {field}"):
+                        vulnops.load_asset_context(source)
+
+    def test_asset_context_rejects_missing_duplicate_and_extra_columns(self):
+        columns = ["defender_machine_id", "asset_id", "asset_criticality", "internet_exposed", "owner_team"]
+        headers = [columns[:index] + columns[index + 1:] for index in range(len(columns))]
+        headers += [[], columns + ["extra"], columns[:-1] + ["asset_id"]]
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "asset_context.csv"
+            for header in headers:
+                with self.subTest(header=header):
+                    source.write_text(",".join(header) + "\n")
+                    with self.assertRaisesRegex(ValueError, "must contain exactly"):
+                        vulnops.load_asset_context(source)
+
+    def test_asset_context_rejects_malformed_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "asset_context.csv"
+            for row in ("abc123,payments-api-01,critical,true",
+                        "abc123,payments-api-01,critical,true,payments-platform,extra"):
+                with self.subTest(row=row):
+                    source.write_text("defender_machine_id,asset_id,asset_criticality,internet_exposed,owner_team\n"
+                                      f"{row}\n")
+                    with self.assertRaisesRegex(ValueError, "wrong number of fields"):
+                        vulnops.load_asset_context(source)
+
+    def test_asset_context_accepts_header_only_and_reordered_columns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "asset_context.csv"
+            source.write_text("owner_team,internet_exposed,asset_criticality,asset_id,defender_machine_id\n")
+            self.assertEqual(vulnops.load_asset_context(source), {})
+            with source.open("a") as output:
+                output.write("unknown,unknown,low,server,abc123\n")
+            self.assertEqual(vulnops.load_asset_context(source), {
+                "abc123": {"asset_id": "server", "asset_criticality": "low",
+                           "internet_exposed": "unknown", "owner_team": "unknown"}})
+
     def test_apply_verification_status_derives_four_outcomes_and_preserves_fields(self):
         fields = {"cve": "CVE-2026-1234", "criticality": "critical", "asset_criticality": "critical",
                   "severity": "high", "internet_exposed": "false", "owner_team": "payments-platform",
@@ -49,10 +773,10 @@ class VulnOpsTests(unittest.TestCase):
             root = Path(directory)
             (root / "data").mkdir()
             (root / "state").mkdir()
-            input_path = root / "data" / "findings.csv"
+            input_path = root / "data" / "finding_fixture.csv"
             input_path.write_text("asset_id,criticality,cve,internet_exposed,owner_team\n"
                                   "critical-server,critical,CVE-2026-1234,false,payments-platform\n")
-            baseline = vulnops.prioritize(vulnops.enrich_with_epss(vulnops.load_findings(input_path), epss), {cve})[0]
+            baseline = vulnops.prioritize(vulnops.enrich_with_epss(self.read_fixture_findings(input_path), epss), {cve})[0]
             self.assertEqual(baseline["priority"], "P0")
             for case, remediation, present, verification, active in cases:
                 with self.subTest(case=case):
@@ -61,7 +785,7 @@ class VulnOpsTests(unittest.TestCase):
                     state_path.write_text(f"asset_id,cve,remediation_status\ncritical-server,{cve},{remediation}\n")
                     evidence_path.write_text("asset_id,cve,vulnerability_present\n" +
                                              ("" if present is None else f"critical-server,{cve},{str(present).lower()}\n"))
-                    findings = vulnops.apply_remediation_status(vulnops.load_findings(input_path),
+                    findings = vulnops.apply_remediation_status(self.read_fixture_findings(input_path),
                                                                 vulnops.load_remediation_statuses(state_path))
                     findings = vulnops.apply_verification_status(findings, vulnops.load_verification_results(evidence_path))
                     findings = vulnops.enrich_with_epss(findings, epss)
@@ -75,7 +799,7 @@ class VulnOpsTests(unittest.TestCase):
                     self.assertEqual({field: result[field] for field in baseline}, baseline)
                     with patch("vulnops.ROOT", root), patch("vulnops.load_kev", return_value={cve}):
                         with patch("vulnops.load_epss", return_value=epss), patch("sys.stdout", new_callable=io.StringIO):
-                            self.assertEqual(vulnops.main(), 0)
+                            self.assertEqual(self.run_fixture_main(), 0)
                     with (root / "output" / "remediation_queue.csv").open(newline="") as output:
                         rows = list(csv.DictReader(output))
                     self.assertEqual(len(rows), 1 if active else 0)
@@ -262,7 +986,7 @@ class VulnOpsTests(unittest.TestCase):
             root = Path(directory)
             (root / "data").mkdir()
             (root / "state").mkdir()
-            (root / "data" / "findings.csv").write_text(
+            (root / "data" / "finding_fixture.csv").write_text(
                 "asset_id,criticality,cve,internet_exposed,owner_team\n"
                 "payments-api-01,critical,CVE-2026-1234,false,payments-platform\n")
             state_path = root / "state" / "remediation_status.csv"
@@ -279,7 +1003,7 @@ class VulnOpsTests(unittest.TestCase):
             with patch("vulnops.ROOT", root), patch("vulnops.urlopen", side_effect=responses):
                 with patch("vulnops.write_queue", wraps=vulnops.write_queue) as write:
                     with patch("sys.stdout", new_callable=io.StringIO):
-                        self.assertEqual(vulnops.main(), 0)
+                        self.assertEqual(self.run_fixture_main(), 0)
             queue = write.call_args.args[1]
             self.assertEqual(len(queue), 1)
             finding = queue[0]
@@ -303,7 +1027,7 @@ class VulnOpsTests(unittest.TestCase):
             root = Path(directory)
             (root / "data").mkdir()
             (root / "state").mkdir()
-            input_path = root / "data" / "findings.csv"
+            input_path = root / "data" / "finding_fixture.csv"
             state_path = root / "state" / "remediation_status.csv"
             evidence_path = root / "data" / "verification_results.csv"
             input_path.write_text("asset_id,criticality,cve,internet_exposed,owner_team\n"
@@ -312,14 +1036,14 @@ class VulnOpsTests(unittest.TestCase):
             evidence_path.write_text("asset_id,cve,vulnerability_present\npayments-api-01,CVE-2026-1234,false\n")
             original_inputs = {path: path.read_bytes() for path in (input_path, state_path, evidence_path)}
             kev_cves = {"CVE-2026-1234"}
-            baseline = vulnops.prioritize(vulnops.load_findings(input_path), kev_cves)[0]
+            baseline = vulnops.prioritize(self.read_fixture_findings(input_path), kev_cves)[0]
             kev = io.BytesIO(b'{"vulnerabilities": [{"cveID": "CVE-2026-1234"}]}')
             with patch("vulnops.ROOT", root), patch("vulnops.urlopen", return_value=kev):
                 with patch("vulnops.apply_verification_status", wraps=vulnops.apply_verification_status) as verify:
                     with patch("vulnops.load_epss", wraps=vulnops.load_epss) as epss:
                         with patch("vulnops.prioritize", wraps=vulnops.prioritize) as classify:
                             with patch("sys.stdout", new_callable=io.StringIO):
-                                self.assertEqual(vulnops.main(), 0)
+                                self.assertEqual(self.run_fixture_main(), 0)
             verify.assert_called_once()
             derived = vulnops.apply_verification_status(*verify.call_args.args)
             self.assertEqual(len(derived), 1)
@@ -334,7 +1058,7 @@ class VulnOpsTests(unittest.TestCase):
             with (root / "output" / "remediation_queue.csv").open(newline="") as output:
                 self.assertEqual(list(csv.DictReader(output)), [])
             self.assertEqual({path: path.read_bytes() for path in original_inputs}, original_inputs)
-            self.assertEqual(len(vulnops.load_findings(input_path)), 1)
+            self.assertEqual(len(self.read_fixture_findings(input_path)), 1)
             key = ("payments-api-01", "CVE-2026-1234")
             self.assertEqual(vulnops.load_remediation_statuses(state_path)[key], "resolved")
             self.assertIs(vulnops.load_verification_results(evidence_path)[key], False)
@@ -350,14 +1074,14 @@ class VulnOpsTests(unittest.TestCase):
             root = Path(directory)
             (root / "data").mkdir()
             (root / "state").mkdir()
-            input_path = root / "data" / "findings.csv"
+            input_path = root / "data" / "finding_fixture.csv"
             state_path = root / "state" / "remediation_status.csv"
             evidence_path = root / "data" / "verification_results.csv"
             input_path.write_text("asset_id,criticality,cve,internet_exposed,owner_team\n"
                                   f"payments-api-01,critical,{cve},true,payments-platform\n")
             original_input = input_path.read_bytes()
             baseline = vulnops.prioritize(
-                vulnops.enrich_with_epss(vulnops.load_findings(input_path), epss), set())[0]
+                vulnops.enrich_with_epss(self.read_fixture_findings(input_path), epss), set())[0]
             self.assertEqual(baseline["priority"], "P2")
             for phase, claim, evidence, status, verification, active in phases:
                 with self.subTest(phase=phase):
@@ -371,7 +1095,7 @@ class VulnOpsTests(unittest.TestCase):
                             with patch("vulnops.apply_verification_status", wraps=vulnops.apply_verification_status) as verify:
                                 with patch("vulnops.write_queue", wraps=vulnops.write_queue) as write:
                                     with patch("sys.stdout", new_callable=io.StringIO):
-                                        self.assertEqual(vulnops.main(), 0)
+                                        self.assertEqual(self.run_fixture_main(), 0)
                     derived = vulnops.apply_verification_status(*verify.call_args.args)
                     self.assertEqual(len(derived), 1)
                     self.assertEqual(derived[0]["remediation_status"], status)
@@ -397,7 +1121,7 @@ class VulnOpsTests(unittest.TestCase):
             root = Path(directory)
             (root / "data").mkdir()
             (root / "state").mkdir()
-            input_path = root / "data" / "findings.csv"
+            input_path = root / "data" / "finding_fixture.csv"
             state_path = root / "state" / "remediation_status.csv"
             evidence_path = root / "data" / "verification_results.csv"
             input_path.write_text(
@@ -421,7 +1145,7 @@ class VulnOpsTests(unittest.TestCase):
                         with patch("vulnops.load_epss", return_value=epss):
                             with patch("vulnops.write_queue", wraps=vulnops.write_queue) as write:
                                 with patch("sys.stdout", new_callable=io.StringIO):
-                                    self.assertEqual(vulnops.main(), 0)
+                                    self.assertEqual(self.run_fixture_main(), 0)
                     internal = write.call_args.args[1]
                     target = next(row for row in internal if row["asset_id"] == "payments-api-01")
                     self.assertEqual(target["remediation_status"], status)
@@ -462,7 +1186,7 @@ class VulnOpsTests(unittest.TestCase):
             root = Path(directory)
             (root / "data").mkdir()
             (root / "state").mkdir()
-            paths = {root / "data" / "findings.csv": source,
+            paths = {root / "data" / "finding_fixture.csv": source,
                      root / "state" / "remediation_status.csv": state,
                      root / "data" / "verification_results.csv": evidence}
             for path, content in paths.items():
@@ -475,7 +1199,7 @@ class VulnOpsTests(unittest.TestCase):
                         with patch("vulnops.load_epss", return_value=epss):
                             with patch("vulnops.prioritize", wraps=vulnops.prioritize) as classify:
                                 with patch("sys.stdout", new_callable=io.StringIO):
-                                    self.assertEqual(vulnops.main(), 0)
+                                    self.assertEqual(self.run_fixture_main(), 0)
                     active = classify.call_args.args[0]
                     self.assertEqual({row["asset_id"]: (row["remediation_status"], row["verification_status"])
                                       for row in active}, {
@@ -515,7 +1239,7 @@ class VulnOpsTests(unittest.TestCase):
             (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\n")
             (root / "data").mkdir(exist_ok=True)
             (root / "state").mkdir()
-            input_path = root / "data" / "findings.csv"
+            input_path = root / "data" / "finding_fixture.csv"
             state_path = root / "state" / "remediation_status.csv"
             input_path.write_text(source)
             state_path.write_text(state)
@@ -529,7 +1253,7 @@ class VulnOpsTests(unittest.TestCase):
                     with patch("vulnops.ROOT", root), patch("vulnops.urlopen", side_effect=responses):
                         with patch("vulnops.prioritize", wraps=vulnops.prioritize) as classify:
                             with patch("sys.stdout", new_callable=io.StringIO):
-                                self.assertEqual(vulnops.main(), 0)
+                                self.assertEqual(self.run_fixture_main(), 0)
                     before_classification = classify.call_args.args[0]
                     self.assertEqual([row["asset_id"] for row in before_classification], ["A", "C"])
                     self.assertTrue(all(row["remediation_status"] == "open" for row in before_classification))
@@ -557,7 +1281,7 @@ class VulnOpsTests(unittest.TestCase):
             (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\n")
             (root / "data").mkdir(exist_ok=True)
             (root / "state").mkdir()
-            (root / "data" / "findings.csv").write_text(
+            (root / "data" / "finding_fixture.csv").write_text(
                 "asset_id,criticality,cve,internet_exposed,owner_team\n"
                 "B,critical,CVE-2026-1234,true,unknown\n")
             state_path = root / "state" / "remediation_status.csv"
@@ -567,7 +1291,7 @@ class VulnOpsTests(unittest.TestCase):
             with patch("vulnops.ROOT", root), patch("vulnops.load_kev", return_value={"CVE-2026-1234"}):
                 with patch("vulnops.load_epss", wraps=vulnops.load_epss) as epss:
                     with patch("vulnops.urlopen") as request, patch("sys.stdout", new_callable=io.StringIO):
-                        self.assertEqual(vulnops.main(), 0)
+                        self.assertEqual(self.run_fixture_main(), 0)
             epss.assert_called_once_with([])
             request.assert_not_called()
             with (root / "output" / "remediation_queue.csv").open(newline="") as output:
@@ -592,13 +1316,13 @@ class VulnOpsTests(unittest.TestCase):
             (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\n")
             (root / "data").mkdir(exist_ok=True)
             (root / "state").mkdir()
-            input_path = root / "data" / "findings.csv"
+            input_path = root / "data" / "finding_fixture.csv"
             state_path = root / "state" / "remediation_status.csv"
             input_path.write_text(source)
             state_path.write_text(state)
             (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\nB,CVE-2026-1234,false\nD,CVE-2026-5678,false\n")
             original_state = state_path.read_bytes()
-            findings = vulnops.load_findings(input_path)
+            findings = self.read_fixture_findings(input_path)
             findings = vulnops.apply_remediation_status(findings, vulnops.load_remediation_statuses(state_path))
             findings = vulnops.enrich_with_epss(findings, epss)
 
@@ -616,7 +1340,7 @@ class VulnOpsTests(unittest.TestCase):
                 with patch("vulnops.load_epss", return_value=epss):
                     with patch("vulnops.prioritize", wraps=vulnops.prioritize) as classify:
                         with patch("sys.stdout", new_callable=io.StringIO):
-                            self.assertEqual(vulnops.main(), 0)
+                            self.assertEqual(self.run_fixture_main(), 0)
             self.assertEqual([row["asset_id"] for row in classify.call_args.args[0]], ["A", "C"])
             with (root / "output" / "remediation_queue.csv").open(newline="") as output:
                 rows = list(csv.DictReader(output))
@@ -645,9 +1369,9 @@ class VulnOpsTests(unittest.TestCase):
             (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\n")
             (root / "data").mkdir(exist_ok=True)
             (root / "state").mkdir()
-            input_path = root / "data" / "findings.csv"
+            input_path = root / "data" / "finding_fixture.csv"
             input_path.write_text(source)
-            findings = vulnops.load_findings(input_path)
+            findings = self.read_fixture_findings(input_path)
             state_path = root / "state" / "remediation_status.csv"
             state_path.write_text("asset_id,cve,remediation_status\n" +
                                   "".join(f"{row['asset_id']},{row['cve']},open\n" for row in findings) +
@@ -664,7 +1388,7 @@ class VulnOpsTests(unittest.TestCase):
                         with patch("vulnops.load_epss", return_value=epss):
                             with patch("vulnops.prioritize", wraps=vulnops.prioritize) as classify:
                                 with patch("sys.stdout", new_callable=io.StringIO):
-                                    self.assertEqual(vulnops.main(), 0)
+                                    self.assertEqual(self.run_fixture_main(), 0)
                     self.assertNotIn("D", [row["asset_id"] for row in classify.call_args.args[0]])
                     with (root / "output" / "remediation_queue.csv").open(newline="") as output:
                         rows = list(csv.DictReader(output))
@@ -790,9 +1514,9 @@ class VulnOpsTests(unittest.TestCase):
 
     def test_csv_pipeline_normalizes_and_writes_fixed_columns(self):
         with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / "findings.csv"
+            source = Path(directory) / "finding_fixture.csv"
             source.write_text("cve,asset_id,criticality,internet_exposed,owner_team\n cve-2021-44228 ,\"server, UK\", Critical ,unknown,unknown\n")
-            findings = vulnops.load_findings(source)
+            findings = self.read_fixture_findings(source)
             destination = Path(directory) / "output" / "remediation_queue.csv"
             vulnops.write_queue(destination, vulnops.prioritize(findings, {"CVE-2021-44228"}))
             with destination.open(newline="") as output:
@@ -830,7 +1554,7 @@ class VulnOpsTests(unittest.TestCase):
                     (root / "state").mkdir()
                     (root / "state" / "remediation_status.csv").write_text("asset_id,cve,remediation_status\n")
                     (root / "data").mkdir(exist_ok=True)
-                    with (root / "data" / "findings.csv").open("w", newline="") as source:
+                    with (root / "data" / "finding_fixture.csv").open("w", newline="") as source:
                         writer = csv.DictWriter(source, fieldnames=["asset_id", "criticality", "cve",
                                                                    "internet_exposed", "owner_team"])
                         writer.writeheader()
@@ -838,7 +1562,7 @@ class VulnOpsTests(unittest.TestCase):
                         writer.writerows(reversed(findings))
                     with patch("vulnops.ROOT", root), patch("vulnops.load_kev", return_value=set()):
                         with patch("vulnops.load_epss", return_value=epss), patch("sys.stdout", new_callable=io.StringIO):
-                            self.assertEqual(vulnops.main(), 0)
+                            self.assertEqual(self.run_fixture_main(), 0)
                     with (root / "output" / "remediation_queue.csv").open(newline="") as output:
                         rows = list(csv.DictReader(output))
                     self.assertEqual([row["asset_id"] for row in rows], expected)
@@ -852,11 +1576,11 @@ class VulnOpsTests(unittest.TestCase):
 
     def test_owner_team_accepts_team_name_and_explicit_unknown(self):
         with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / "findings.csv"
+            source = Path(directory) / "finding_fixture.csv"
             for value in ("payments-platform", "unknown"):
                 with self.subTest(owner_team=value):
                     source.write_text(f"asset_id,criticality,cve,internet_exposed,owner_team\nserver,critical,CVE-2021-44228,true,{value}\n")
-                    finding = vulnops.load_findings(source)[0]
+                    finding = self.read_fixture_findings(source)[0]
                     self.assertEqual(finding["owner_team"], value)
                     self.assertIsInstance(finding["owner_team"], str)
 
@@ -877,10 +1601,10 @@ class VulnOpsTests(unittest.TestCase):
                               f"C,critical,CVE-2099-10002,true,{team}\n"
                               f"B,medium,CVE-2099-10001,false,{team}\n"
                               f"A,critical,CVE-2099-10001,false,{team}\n")
-                    (root / "data" / "findings.csv").write_text(source)
+                    (root / "data" / "finding_fixture.csv").write_text(source)
                     with patch("vulnops.ROOT", root), patch("vulnops.load_kev", return_value={"CVE-2099-10001"}):
                         with patch("vulnops.load_epss", return_value=epss), patch("sys.stdout", new_callable=io.StringIO):
-                            self.assertEqual(vulnops.main(), 0)
+                            self.assertEqual(self.run_fixture_main(), 0)
                     with (root / "output" / "remediation_queue.csv").open(newline="") as output:
                         rows = list(csv.DictReader(output))
                     self.assertEqual([row["asset_id"] for row in rows], ["A", "B", "C"])
@@ -908,17 +1632,17 @@ class VulnOpsTests(unittest.TestCase):
             (root / "state").mkdir()
             (root / "state" / "remediation_status.csv").write_text("asset_id,cve,remediation_status\n")
             (root / "data").mkdir(exist_ok=True)
-            input_path = root / "data" / "findings.csv"
+            input_path = root / "data" / "finding_fixture.csv"
             input_path.write_text(source)
-            findings = vulnops.load_findings(input_path)
+            findings = self.read_fixture_findings(input_path)
             baseline_findings = [{key: value for key, value in row.items() if key != "owner_team"}
                                  for row in findings]
             outputs = []
             for inputs in (baseline_findings, findings):
-                with patch("vulnops.ROOT", root), patch("vulnops.load_findings", return_value=inputs):
+                with patch("vulnops.ROOT", root), patch.object(self, "read_fixture_findings", return_value=inputs):
                     with patch("vulnops.load_kev", return_value={"CVE-2099-10001"}):
                         with patch("vulnops.load_epss", return_value=epss), patch("sys.stdout", new_callable=io.StringIO):
-                            self.assertEqual(vulnops.main(), 0)
+                            self.assertEqual(self.run_fixture_main(), 0)
                 with (root / "output" / "remediation_queue.csv").open(newline="") as output:
                     reader = csv.DictReader(output)
                     self.assertEqual(reader.fieldnames, ["asset_id", "criticality", "cve", "internet_exposed", "owner_team",
@@ -949,7 +1673,7 @@ class VulnOpsTests(unittest.TestCase):
                               f"payments-api-01,critical,CVE-2099-10001,true,{team}\n"
                               "higher-epss,critical,CVE-2099-10002,true,identity\n"
                               "known-kev,critical,CVE-2099-10003,false,data-platform\n")
-                    (root / "data" / "findings.csv").write_text(source)
+                    (root / "data" / "finding_fixture.csv").write_text(source)
                     kev_cves = {"CVE-2099-10003"}
                     if is_kev:
                         kev_cves.add("CVE-2099-10001")
@@ -965,7 +1689,7 @@ class VulnOpsTests(unittest.TestCase):
                             with patch("vulnops.prioritize", wraps=vulnops.prioritize) as classify:
                                 with patch("vulnops.write_queue", wraps=vulnops.write_queue) as write:
                                     with patch("sys.stdout", new_callable=io.StringIO):
-                                        self.assertEqual(vulnops.main(), 0)
+                                        self.assertEqual(self.run_fixture_main(), 0)
                     after_epss = classify.call_args.args[0]
                     # KEV enrichment and classification occur together in prioritize().
                     classified = vulnops.prioritize(after_epss, kev_cves)
@@ -988,29 +1712,15 @@ class VulnOpsTests(unittest.TestCase):
                     self.assertEqual(target["priority"], "P0" if is_kev else "P2")
                     self.assertEqual(csv_rows[0 if is_kev else -1]["asset_id"], "payments-api-01")
 
-    def test_owner_team_rejects_blank_values(self):
-        with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / "findings.csv"
-            for value in ("", "   "):
-                with self.subTest(owner_team=value):
-                    source.write_text(f"asset_id,criticality,cve,internet_exposed,owner_team\nserver,critical,CVE-2021-44228,true,{value}\n")
-                    with self.assertRaisesRegex(ValueError, "empty owner_team"):
-                        vulnops.load_findings(source)
 
-    def test_owner_team_column_is_required(self):
-        with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / "findings.csv"
-            source.write_text("asset_id,criticality,cve,internet_exposed\nserver,critical,CVE-2021-44228,true\n")
-            with self.assertRaisesRegex(ValueError, "owner_team"):
-                vulnops.load_findings(source)
 
     def test_internet_exposed_accepts_and_retains_three_strings(self):
         with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / "findings.csv"
+            source = Path(directory) / "finding_fixture.csv"
             for value in ("true", "false", "unknown"):
                 with self.subTest(value=value):
                     source.write_text(f"asset_id,criticality,cve,internet_exposed,owner_team\nserver,critical,CVE-2021-44228,{value},unknown\n")
-                    finding = vulnops.load_findings(source)[0]
+                    finding = self.read_fixture_findings(source)[0]
                     self.assertEqual(finding["internet_exposed"], value)
                     self.assertIsInstance(finding["internet_exposed"], str)
 
@@ -1038,14 +1748,14 @@ class VulnOpsTests(unittest.TestCase):
             (root / "state").mkdir()
             (root / "state" / "remediation_status.csv").write_text("asset_id,cve,remediation_status\n")
             (root / "data").mkdir(exist_ok=True)
-            (root / "data" / "findings.csv").write_text(source)
+            (root / "data" / "finding_fixture.csv").write_text(source)
             responses = [io.BytesIO(json.dumps(feed).encode()) for feed in (kev, epss)]
             with patch("vulnops.ROOT", root), patch("vulnops.urlopen", side_effect=responses):
                 with patch("vulnops.enrich_with_epss", wraps=vulnops.enrich_with_epss) as enrich:
                     with patch("vulnops.prioritize", wraps=vulnops.prioritize) as classify:
                         with patch("vulnops.write_queue", wraps=vulnops.write_queue) as write:
                             with patch("sys.stdout", new_callable=io.StringIO):
-                                self.assertEqual(vulnops.main(), 0)
+                                self.assertEqual(self.run_fixture_main(), 0)
             after_epss = classify.call_args.args[0]
             # KEV is attached inside prioritize(), rather than a separate enrichment stage.
             after_classification = vulnops.prioritize(after_epss, {"CVE-2099-10002"})
@@ -1089,16 +1799,16 @@ class VulnOpsTests(unittest.TestCase):
             (root / "state").mkdir()
             (root / "state" / "remediation_status.csv").write_text("asset_id,cve,remediation_status\n")
             (root / "data").mkdir(exist_ok=True)
-            input_path = root / "data" / "findings.csv"
+            input_path = root / "data" / "finding_fixture.csv"
             input_path.write_text(source)
-            findings = vulnops.load_findings(input_path)
+            findings = self.read_fixture_findings(input_path)
             baseline_findings = [{**row, "internet_exposed": "unknown"} for row in findings]
             outputs = []
             for inputs in (baseline_findings, findings):
-                with patch("vulnops.ROOT", root), patch("vulnops.load_findings", return_value=inputs):
+                with patch("vulnops.ROOT", root), patch.object(self, "read_fixture_findings", return_value=inputs):
                     with patch("vulnops.load_kev", return_value={"CVE-2099-10002"}):
                         with patch("vulnops.load_epss", return_value=epss), patch("sys.stdout", new_callable=io.StringIO):
-                            self.assertEqual(vulnops.main(), 0)
+                            self.assertEqual(self.run_fixture_main(), 0)
                 with (root / "output" / "remediation_queue.csv").open(newline="") as output:
                     reader = csv.DictReader(output)
                     self.assertEqual(reader.fieldnames, ["asset_id", "criticality", "cve", "internet_exposed", "owner_team",
@@ -1115,48 +1825,14 @@ class VulnOpsTests(unittest.TestCase):
                 ("P0", "false"), ("P1", "true"), ("P2", "true"), ("P2", "unknown"), ("P2", "false"),
             ])
 
-    def test_internet_exposed_rejects_invalid_values(self):
-        with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / "findings.csv"
-            for value in ("yes", "", "maybe", "True", "FALSE", "Unknown"):
-                with self.subTest(value=value):
-                    source.write_text(f"asset_id,criticality,cve,internet_exposed,owner_team\nserver,critical,CVE-2021-44228,{value},unknown\n")
-                    with self.assertRaisesRegex(ValueError, "internet_exposed"):
-                        vulnops.load_findings(source)
 
-    def test_internet_exposed_column_is_required(self):
-        with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / "findings.csv"
-            source.write_text("asset_id,criticality,cve,owner_team\nserver,critical,CVE-2021-44228,unknown\n")
-            with self.assertRaisesRegex(ValueError, "internet_exposed"):
-                vulnops.load_findings(source)
 
-    def test_invalid_inputs_are_rejected(self):
-        invalid_csvs = [
-            "",
-            "asset_id,cve,internet_exposed,owner_team\nserver,CVE-2021-44228,unknown,unknown\n",
-            "asset_id,criticality,cve,cve,internet_exposed,owner_team\n",
-            "asset_id,criticality,cve,internet_exposed,priority,owner_team\n",
-            "asset_id,criticality,cve,internet_exposed,owner,owner_team\nserver,critical,CVE-2021-44228,unknown,Ops,unknown\n",
-            "asset_id,criticality,cve,internet_exposed,owner_team\n,critical,CVE-2021-44228,unknown,unknown\n",
-            "asset_id,criticality,cve,internet_exposed,owner_team\nserver,,CVE-2021-44228,unknown,unknown\n",
-            "asset_id,criticality,cve,internet_exposed,owner_team\nserver,critical,invalid,unknown,unknown\n",
-            "asset_id,criticality,cve,internet_exposed,owner_team\nserver,critical,unknown\n",
-            "asset_id,criticality,cve,internet_exposed,owner_team\nserver,critical,CVE-2021-44228,unknown,extra,unknown\n",
-        ]
-        with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / "findings.csv"
-            for content in invalid_csvs:
-                with self.subTest(content=content):
-                    source.write_text(content)
-                    with self.assertRaises(ValueError):
-                        vulnops.load_findings(source)
 
     def test_header_only_input_produces_header_only_output(self):
         with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / "findings.csv"
+            source = Path(directory) / "finding_fixture.csv"
             source.write_text("asset_id,criticality,cve,internet_exposed,owner_team\n")
-            findings = vulnops.load_findings(source)
+            findings = self.read_fixture_findings(source)
             destination = Path(directory) / "queue.csv"
             vulnops.write_queue(destination, vulnops.prioritize(findings, {"CVE-2021-44228"}))
             self.assertEqual(destination.read_text().strip(),
@@ -1307,10 +1983,10 @@ class VulnOpsTests(unittest.TestCase):
             (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\n")
             (root / "state").mkdir()
             (root / "state" / "remediation_status.csv").write_text("asset_id,cve,remediation_status\n")
-            with patch("vulnops.ROOT", root), patch("vulnops.load_findings", return_value=findings):
+            with patch("vulnops.ROOT", root), patch.object(self, "read_fixture_findings", return_value=findings):
                 with patch("vulnops.load_kev", return_value=kev_cves), patch("vulnops.load_epss", return_value=epss):
                     with patch("sys.stdout", new_callable=io.StringIO):
-                        self.assertEqual(vulnops.main(), 0)
+                        self.assertEqual(self.run_fixture_main(), 0)
             with (root / "output" / "remediation_queue.csv").open(newline="") as output:
                 rows = list(csv.DictReader(output))
 
@@ -1344,10 +2020,10 @@ class VulnOpsTests(unittest.TestCase):
             (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\n")
             (root / "state").mkdir()
             (root / "state" / "remediation_status.csv").write_text("asset_id,cve,remediation_status\n")
-            with patch("vulnops.ROOT", root), patch("vulnops.load_findings", return_value=shuffled):
+            with patch("vulnops.ROOT", root), patch.object(self, "read_fixture_findings", return_value=shuffled):
                 with patch("vulnops.load_kev", return_value=kev_cves), patch("vulnops.load_epss", return_value=epss):
                     with patch("sys.stdout", new_callable=io.StringIO):
-                        self.assertEqual(vulnops.main(), 0)
+                        self.assertEqual(self.run_fixture_main(), 0)
             with (root / "output" / "remediation_queue.csv").open(newline="") as output:
                 rows = list(csv.DictReader(output))
 
@@ -1384,7 +2060,7 @@ class VulnOpsTests(unittest.TestCase):
                 findings = [{"asset_id": asset, "criticality": "critical",
                              "cve": f"CVE-2099-{1000 + index}", "internet_exposed": exposure, "owner_team": "unknown"}
                             for index, (asset, exposure, score) in enumerate(inputs)]
-                with (root / "data" / "findings.csv").open("w", newline="") as source:
+                with (root / "data" / "finding_fixture.csv").open("w", newline="") as source:
                     writer = csv.DictWriter(source, fieldnames=["asset_id", "criticality", "cve", "internet_exposed", "owner_team"])
                     writer.writeheader()
                     writer.writerows(findings)
@@ -1394,7 +2070,7 @@ class VulnOpsTests(unittest.TestCase):
                     with patch("vulnops.load_epss", return_value=epss):
                         with patch("vulnops.write_queue", wraps=vulnops.write_queue) as write:
                             with patch("sys.stdout", new_callable=io.StringIO):
-                                self.assertEqual(vulnops.main(), 0)
+                                self.assertEqual(self.run_fixture_main(), 0)
                 in_memory = {row["asset_id"]: row for row in write.call_args.args[1]}
                 for asset, exposure, score in inputs:
                     self.assertEqual(in_memory[asset]["internet_exposed"], exposure)
@@ -1431,7 +2107,7 @@ class VulnOpsTests(unittest.TestCase):
                 (root / "data").mkdir(exist_ok=True)
                 findings = [{"asset_id": asset, "criticality": "critical", "cve": f"CVE-2099-{1000 + index}",
                              "internet_exposed": exposure, "owner_team": "unknown"} for index, (asset, exposure, score) in enumerate(inputs)]
-                with (root / "data" / "findings.csv").open("w", newline="") as source:
+                with (root / "data" / "finding_fixture.csv").open("w", newline="") as source:
                     writer = csv.DictWriter(source, fieldnames=["asset_id", "criticality", "cve", "internet_exposed", "owner_team"])
                     writer.writeheader()
                     writer.writerows(findings)
@@ -1443,7 +2119,7 @@ class VulnOpsTests(unittest.TestCase):
                             with patch("vulnops.prioritize", wraps=vulnops.prioritize) as classify:
                                 with patch("vulnops.write_queue", wraps=vulnops.write_queue) as write:
                                     with patch("sys.stdout", new_callable=io.StringIO):
-                                        self.assertEqual(vulnops.main(), 0)
+                                        self.assertEqual(self.run_fixture_main(), 0)
                 with (root / "output" / "remediation_queue.csv").open(newline="") as output:
                     rows = list(csv.DictReader(output))
                 expected_exposures = {asset: exposure for asset, exposure, score in inputs}
@@ -1470,11 +2146,11 @@ class VulnOpsTests(unittest.TestCase):
             (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\n")
             (root / "state").mkdir()
             (root / "state" / "remediation_status.csv").write_text("asset_id,cve,remediation_status\n")
-            with patch("vulnops.ROOT", root), patch("vulnops.load_findings", return_value=findings):
+            with patch("vulnops.ROOT", root), patch.object(self, "read_fixture_findings", return_value=findings):
                 with patch("vulnops.load_kev", return_value=set()), patch("vulnops.load_epss", return_value=epss):
                     with patch("vulnops.write_queue", wraps=vulnops.write_queue) as write:
                         with patch("sys.stdout", new_callable=io.StringIO):
-                            self.assertEqual(vulnops.main(), 0)
+                            self.assertEqual(self.run_fixture_main(), 0)
             results = write.call_args.args[1]
             expected = [f"{exposure}-{label}" for exposure in ("true", "unknown", "false")
                         for label in ("high", "tie-first", "tie-second", "low", "zero", "missing-first", "missing-second")]
@@ -1505,11 +2181,11 @@ class VulnOpsTests(unittest.TestCase):
                 (root / "data" / "verification_results.csv").write_text("asset_id,cve,vulnerability_present\n")
                 (root / "state").mkdir()
                 (root / "state" / "remediation_status.csv").write_text("asset_id,cve,remediation_status\n")
-                with patch("vulnops.ROOT", root), patch("vulnops.load_findings", return_value=findings):
+                with patch("vulnops.ROOT", root), patch.object(self, "read_fixture_findings", return_value=findings):
                     with patch("vulnops.load_kev", return_value=set()), patch("vulnops.load_epss", return_value=epss):
                         with patch("vulnops.write_queue", wraps=vulnops.write_queue) as write:
                             with patch("sys.stdout", new_callable=io.StringIO):
-                                self.assertEqual(vulnops.main(), 0)
+                                self.assertEqual(self.run_fixture_main(), 0)
                 output = write.call_args.args[1]
                 self.assertEqual([row["asset_id"] for row in output], expected)
                 self.assertTrue(all(row["priority"] == "P2" for row in output))
@@ -1556,16 +2232,16 @@ class VulnOpsTests(unittest.TestCase):
             (root / "state").mkdir()
             (root / "state" / "remediation_status.csv").write_text("asset_id,cve,remediation_status\n")
             (root / "data").mkdir(exist_ok=True)
-            input_path = root / "data" / "findings.csv"
+            input_path = root / "data" / "finding_fixture.csv"
             input_path.write_text(source)
-            baseline = vulnops.prioritize(vulnops.load_findings(input_path), kev_cves)
+            baseline = vulnops.prioritize(self.read_fixture_findings(input_path), kev_cves)
             outputs = []
             for run in range(2):
                 with self.subTest(run=run + 1):
                     responses = [io.BytesIO(json.dumps(feed).encode()) for feed in (kev, epss)]
                     with patch("vulnops.ROOT", root), patch("vulnops.urlopen", side_effect=responses) as request:
                         with patch("sys.stdout", new_callable=io.StringIO):
-                            self.assertEqual(vulnops.main(), 0)
+                            self.assertEqual(self.run_fixture_main(), 0)
                     self.assertEqual(request.call_count, 2)
                     self.assertEqual(request.call_args_list[0].args[0], vulnops.KEV_URL)
                     self.assertEqual(urlparse(request.call_args_list[1].args[0]).path, "/data/v1/epss")
@@ -1602,7 +2278,7 @@ class VulnOpsTests(unittest.TestCase):
             (root / "state" / "remediation_status.csv").write_text("asset_id,cve,remediation_status\n")
             (root / "data").mkdir(exist_ok=True)
             (root / "output").mkdir()
-            (root / "data" / "findings.csv").write_text("asset_id,criticality,cve,internet_exposed,owner_team\nserver,critical,CVE-2021-44228,unknown,unknown\n")
+            (root / "data" / "finding_fixture.csv").write_text("asset_id,criticality,cve,internet_exposed,owner_team\nserver,critical,CVE-2021-44228,unknown,unknown\n")
             queue = root / "output" / "remediation_queue.csv"
             queue.write_text("previous output\n")
             for failure in (URLError("simulated outage"), io.BytesIO(b"invalid json")):
@@ -1610,7 +2286,7 @@ class VulnOpsTests(unittest.TestCase):
                     kev = io.BytesIO(b'{"vulnerabilities": [{"cveID": "CVE-2021-44228"}]}')
                     with patch("vulnops.ROOT", root), patch("vulnops.urlopen", side_effect=[kev, failure]):
                         with patch("sys.stderr", new_callable=io.StringIO) as stderr:
-                            self.assertEqual(vulnops.main(), 1)
+                            self.assertEqual(self.run_fixture_main(), 1)
                     self.assertIn("FIRST EPSS retrieval failed", stderr.getvalue())
                     self.assertEqual(queue.read_text(), "previous output\n")
 
@@ -1623,12 +2299,12 @@ class VulnOpsTests(unittest.TestCase):
             (root / "state" / "remediation_status.csv").write_text("asset_id,cve,remediation_status\n")
             (root / "data").mkdir(exist_ok=True)
             (root / "output").mkdir()
-            (root / "data" / "findings.csv").write_text("asset_id,criticality,cve,internet_exposed,owner_team\nserver,critical,CVE-2021-44228,unknown,unknown\n")
+            (root / "data" / "finding_fixture.csv").write_text("asset_id,criticality,cve,internet_exposed,owner_team\nserver,critical,CVE-2021-44228,unknown,unknown\n")
             queue = root / "output" / "remediation_queue.csv"
             queue.write_text("previous output\n")
             with patch("vulnops.ROOT", root), patch("vulnops.urlopen", side_effect=URLError("download failed")):
                 with patch("sys.stderr", new_callable=io.StringIO) as stderr:
-                    self.assertEqual(vulnops.main(), 1)
+                    self.assertEqual(self.run_fixture_main(), 1)
             self.assertIn("download failed", stderr.getvalue())
             self.assertEqual(queue.read_text(), "previous output\n")
 
