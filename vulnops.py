@@ -145,6 +145,12 @@ def main():
         epss_by_cve = load_epss(cves)
         findings = enrich_with_epss(findings, epss_by_cve)
         results = prioritize(findings, kev_cves)
+        p2 = [row for row in results if row["priority"] == "P2"]
+        p2.sort(key=lambda row: (
+            row["epss_score"] is None,
+            -row["epss_score"] if row["epss_score"] is not None else 0,
+        ))
+        results = [row for row in results if row["priority"] != "P2"] + p2
         write_queue(ROOT / "output" / "remediation_queue.csv", results)
     except (OSError, ValueError, csv.Error) as error:
         print(f"VulnOps failed: {error}", file=sys.stderr)

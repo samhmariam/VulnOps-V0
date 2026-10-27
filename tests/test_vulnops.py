@@ -224,25 +224,135 @@ class VulnOpsTests(unittest.TestCase):
                 enriched = vulnops.enrich_with_epss([finding], {finding["cve"]: epss})
                 self.assertEqual(enriched, [{**finding, **epss}])
 
-    def test_main_writes_epss_without_changing_v0_queue(self):
+    def test_epss_preserves_p0_and_p1_order_but_ranks_p2(self):
+        cases = [
+            ("A", "critical", True, 0.10),
+            ("B", "critical", True, 0.99),
+            ("C", "critical", True, 0.50),
+            ("D", "medium", True, 0.20),
+            ("E", "medium", True, 0.95),
+            ("F", "medium", True, 0.40),
+            ("G", "medium", False, 0.20),
+            ("H", "medium", False, 0.95),
+            ("I", "medium", False, 0.40),
+        ]
+        findings = [{"asset_id": asset, "criticality": criticality, "cve": f"CVE-2099-{1000 + index}"}
+                    for index, (asset, criticality, kev, score) in enumerate(cases)]
+        kev_cves = {finding["cve"] for finding, case in zip(findings, cases) if case[2]}
+        epss = {finding["cve"]: {"epss_score": case[3], "epss_percentile": None}
+                for finding, case in zip(findings, cases)}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch("vulnops.ROOT", root), patch("vulnops.load_findings", return_value=findings):
+                with patch("vulnops.load_kev", return_value=kev_cves), patch("vulnops.load_epss", return_value=epss):
+                    with patch("sys.stdout", new_callable=io.StringIO):
+                        self.assertEqual(vulnops.main(), 0)
+            with (root / "output" / "remediation_queue.csv").open(newline="") as output:
+                rows = list(csv.DictReader(output))
+
+        self.assertEqual([row["asset_id"] for row in rows], ["A", "B", "C", "D", "E", "F", "H", "I", "G"])
+        for priority, expected in (("P0", ["A", "B", "C"]),
+                                   ("P1", ["D", "E", "F"]),
+                                   ("P2", ["H", "I", "G"])):
+            with self.subTest(priority=priority):
+                self.assertEqual([row["asset_id"] for row in rows if row["priority"] == priority], expected)
+        self.assertEqual([float(row["epss_score"]) for row in rows],
+                         [0.10, 0.99, 0.50, 0.20, 0.95, 0.40, 0.95, 0.40, 0.20])
+
+    def test_low_epss_p1_precedes_high_epss_p2(self):
+        # V0's input field is named criticality; KEV comes from the CVE set.
+        findings = [
+            {"asset_id": "A", "cve": "CVE-2099-10001", "criticality": "critical"},
+            {"asset_id": "B", "cve": "CVE-2099-10002", "criticality": "medium"},
+            {"asset_id": "C", "cve": "CVE-2099-10003", "criticality": "critical"},
+            {"asset_id": "D", "cve": "CVE-2099-10004", "criticality": "medium"},
+            {"asset_id": "E", "cve": "CVE-2099-10005", "criticality": "low"},
+        ]
+        kev_cves = {findings[0]["cve"], findings[1]["cve"]}
+        epss = {finding["cve"]: {"epss_score": score, "epss_percentile": None}
+                for finding, score in zip(findings, [0.001, 0.001, 0.99, 0.80, 0.20])}
+        baseline = {row["asset_id"]: row for row in vulnops.prioritize(findings, kev_cves)}
+        # Shuffle input so neither priority grouping nor P2 ranking passes by accident.
+        shuffled = [findings[index] for index in [4, 2, 1, 3, 0]]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch("vulnops.ROOT", root), patch("vulnops.load_findings", return_value=shuffled):
+                with patch("vulnops.load_kev", return_value=kev_cves), patch("vulnops.load_epss", return_value=epss):
+                    with patch("sys.stdout", new_callable=io.StringIO):
+                        self.assertEqual(vulnops.main(), 0)
+            with (root / "output" / "remediation_queue.csv").open(newline="") as output:
+                rows = list(csv.DictReader(output))
+
+        queue = [row["asset_id"] for row in rows]
+        self.assertEqual(queue, ["A", "B", "C", "D", "E"])
+        self.assertEqual([row["priority"] for row in rows], ["P0", "P1", "P2", "P2", "P2"])
+        self.assertEqual([row["kev"] for row in rows], ["true", "true", "false", "false", "false"])
+        self.assertEqual([float(row["epss_score"]) for row in rows], [0.001, 0.001, 0.99, 0.80, 0.20])
+        self.assertLess(queue.index("B"), queue.index("C"))
+        self.assertLess(queue.index("C"), queue.index("D"))
+        self.assertLess(queue.index("D"), queue.index("E"))
+        for row in rows:
+            self.assertEqual(row["reason"], baseline[row["asset_id"]]["reason"])
+
+    def test_p2_missing_epss_sorts_after_numeric_zero_without_changing_values(self):
+        scores = {"A": 0.80, "B": None, "C": 0.00, "D": 0.10}
+        for assets, expected in (("ABC", ["A", "C", "B"]), ("ABCD", ["A", "D", "C", "B"])):
+            with self.subTest(assets=assets), tempfile.TemporaryDirectory() as directory:
+                findings = [{"asset_id": asset, "criticality": "critical", "cve": f"CVE-2099-{1000 + index}"}
+                            for index, asset in enumerate(assets)]
+                epss = {row["cve"]: {"epss_score": scores[row["asset_id"]], "epss_percentile": None}
+                        for row in findings}
+                root = Path(directory)
+                with patch("vulnops.ROOT", root), patch("vulnops.load_findings", return_value=findings):
+                    with patch("vulnops.load_kev", return_value=set()), patch("vulnops.load_epss", return_value=epss):
+                        with patch("vulnops.write_queue", wraps=vulnops.write_queue) as write:
+                            with patch("sys.stdout", new_callable=io.StringIO):
+                                self.assertEqual(vulnops.main(), 0)
+                output = write.call_args.args[1]
+                self.assertEqual([row["asset_id"] for row in output], expected)
+                self.assertTrue(all(row["priority"] == "P2" for row in output))
+                by_asset = {row["asset_id"]: row for row in output}
+                self.assertEqual(by_asset["C"]["epss_score"], 0.00)
+                self.assertIsInstance(by_asset["C"]["epss_score"], float)
+                self.assertIsNone(by_asset["B"]["epss_score"])
+                self.assertIsNone(epss[findings[1]["cve"]]["epss_score"])
+                with (root / "output" / "remediation_queue.csv").open(newline="") as csv_file:
+                    rows = list(csv.DictReader(csv_file))
+                self.assertEqual([row["asset_id"] for row in rows], expected)
+                csv_by_asset = {row["asset_id"]: row for row in rows}
+                self.assertEqual(csv_by_asset["C"]["epss_score"], "0.0")
+                self.assertEqual(csv_by_asset["B"]["epss_score"], "")
+
+    def test_main_preserves_v0_classification_and_ranks_only_p2_by_epss(self):
         source = ("asset_id,criticality,cve\n"
                   "zero,critical,CVE-2099-10000\n"
                   "p1,medium,CVE-2021-44228\n"
                   "missing,critical,CVE-2099-10001\n"
                   "p0,critical,CVE-2021-44228\n"
+                  "tie-first,low,CVE-2099-10003\n"
+                  "p0-high,critical,CVE-2021-44229\n"
+                  "p1-high,medium,CVE-2021-44229\n"
+                  "tie-second,critical,CVE-2099-10004\n"
+                  "missing-second,low,CVE-2099-10005\n"
+                  "p0-missing,critical,CVE-2021-44230\n"
+                  "p1-missing,medium,CVE-2021-44230\n"
                   "high-epss,critical,CVE-2099-10002\n")
-        kev = {"vulnerabilities": [{"cveID": "CVE-2021-44228"}]}
-        epss = {"status": "OK", "status-code": 200, "total": 3, "data": [
+        kev_cves = {"CVE-2021-44228", "CVE-2021-44229", "CVE-2021-44230"}
+        kev = {"vulnerabilities": [{"cveID": cve} for cve in sorted(kev_cves)]}
+        epss = {"status": "OK", "status-code": 200, "total": 6, "data": [
             {"cve": "CVE-2021-44228", "epss": "0.001", "percentile": "0.25"},
+            {"cve": "CVE-2021-44229", "epss": "0.99", "percentile": "0.999"},
             {"cve": "CVE-2099-10000", "epss": "0", "percentile": "0"},
-            {"cve": "CVE-2099-10002", "epss": "0.99", "percentile": "0.999"},
+            {"cve": "CVE-2099-10002", "epss": "0.99", "percentile": "0.001"},
+            {"cve": "CVE-2099-10003", "epss": "0.5", "percentile": "0.9"},
+            {"cve": "CVE-2099-10004", "epss": "0.5", "percentile": "0.1"},
         ]}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "data").mkdir()
             input_path = root / "data" / "findings.csv"
             input_path.write_text(source)
-            baseline = vulnops.prioritize(vulnops.load_findings(input_path), {"CVE-2021-44228"})
+            baseline = vulnops.prioritize(vulnops.load_findings(input_path), kev_cves)
             outputs = []
             for run in range(2):
                 with self.subTest(run=run + 1):
@@ -260,11 +370,22 @@ class VulnOpsTests(unittest.TestCase):
                 self.assertEqual(reader.fieldnames, ["asset_id", "criticality", "cve", "kev",
                                                     "epss_score", "epss_percentile", "priority", "reason"])
                 rows = list(reader)
-            self.assertEqual([{key: row[key] for key in original} for row, original in zip(rows, baseline)], baseline)
-            self.assertEqual([row["asset_id"] for row in rows], ["p0", "p1", "zero", "missing", "high-epss"])
-            self.assertEqual([row["priority"] for row in rows], ["P0", "P1", "P2", "P2", "P2"])
-            self.assertEqual([row["epss_score"] for row in rows], ["0.001", "0.001", "0.0", "", "0.99"])
-            self.assertEqual([row["epss_percentile"] for row in rows], ["0.25", "0.25", "0.0", "", "0.999"])
+            baseline_by_asset = {row["asset_id"]: row for row in baseline}
+            self.assertEqual(len(rows), len(baseline))
+            for row in rows:
+                original = baseline_by_asset[row["asset_id"]]
+                self.assertEqual({key: row[key] for key in original}, original)
+            self.assertEqual([row["asset_id"] for row in rows], [
+                "p0", "p0-high", "p0-missing", "p1", "p1-high", "p1-missing",
+                "high-epss", "tie-first", "tie-second", "zero", "missing", "missing-second",
+            ])
+            self.assertEqual([row["priority"] for row in rows], ["P0"] * 3 + ["P1"] * 3 + ["P2"] * 6)
+            self.assertEqual([row["epss_score"] for row in rows], [
+                "0.001", "0.99", "", "0.001", "0.99", "", "0.99", "0.5", "0.5", "0.0", "", "",
+            ])
+            self.assertEqual([row["epss_percentile"] for row in rows], [
+                "0.25", "0.999", "", "0.25", "0.999", "", "0.001", "0.9", "0.1", "0.0", "", "",
+            ])
 
     def test_epss_failure_stops_run_and_preserves_existing_queue(self):
         with tempfile.TemporaryDirectory() as directory:
