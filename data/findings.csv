@@ -1,5 +1,5 @@
-asset_id,criticality,cve
-workstation-01,medium,CVE-2099-99999
-web-server-01,high,CVE-2021-44228
-identity-server-01,critical,CVE-2021-44228
-application-server-01,critical,CVE-2026-43500
+asset_id,criticality,cve,internet_exposed
+workstation-01,medium,CVE-2099-99999,false
+web-server-01,high,CVE-2021-44228,true
+identity-server-01,critical,CVE-2021-44228,unknown
+application-server-01,critical,CVE-2026-43500,true

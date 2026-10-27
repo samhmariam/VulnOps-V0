@@ -1,4 +1,5 @@
 import csv
+import inspect
 import io
 import json
 from pathlib import Path
@@ -55,35 +56,181 @@ class VulnOpsTests(unittest.TestCase):
                 self.assertEqual(result["reason"], baseline["reason"])
                 self.assertEqual({key: result[key] for key in baseline}, baseline)
 
+    def test_exposure_and_epss_cannot_change_priority_classification(self):
+        cases = [
+            ("A", True, "critical", "false", 0.001, "P0"),
+            ("B", True, "medium", "false", 0.001, "P1"),
+            ("C", False, "critical", "true", 0.99, "P2"),
+            ("D", False, "critical", "unknown", 0.99, "P2"),
+            ("E", False, "critical", "false", 0.99, "P2"),
+        ]
+        for case, kev, criticality, exposure, score, expected in cases:
+            with self.subTest(case=case):
+                # The existing application calls asset criticality "criticality".
+                finding = {"asset_id": case, "cve": "CVE-2099-10001", "criticality": criticality}
+                kev_cves = {finding["cve"]} if kev else set()
+                baseline = vulnops.prioritize([finding], kev_cves)[0]
+                contextual = {**finding, "internet_exposed": exposure,
+                              "epss_score": score, "epss_percentile": None}
+
+                result = vulnops.prioritize([contextual], kev_cves)[0]
+
+                self.assertEqual(result["priority"], expected)
+                self.assertEqual(result["reason"], baseline["reason"])
+                self.assertEqual({key: result[key] for key in baseline}, baseline)
+                self.assertEqual(result["internet_exposed"], exposure)
+                self.assertEqual(result["epss_score"], score)
+
+    def test_prioritize_does_not_reference_internet_exposed(self):
+        self.assertNotIn("internet_exposed", inspect.getsource(vulnops.prioritize))
+
     def test_csv_pipeline_normalizes_and_writes_fixed_columns(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "findings.csv"
-            source.write_text('cve,asset_id,criticality\n cve-2021-44228 ,"server, UK", Critical \n')
+            source.write_text('cve,asset_id,criticality,internet_exposed\n cve-2021-44228 ,"server, UK", Critical ,unknown\n')
             findings = vulnops.load_findings(source)
             destination = Path(directory) / "output" / "remediation_queue.csv"
             vulnops.write_queue(destination, vulnops.prioritize(findings, {"CVE-2021-44228"}))
             with destination.open(newline="") as output:
                 reader = csv.DictReader(output)
-                self.assertEqual(reader.fieldnames, ["asset_id", "criticality", "cve", "kev",
+                self.assertEqual(reader.fieldnames, ["asset_id", "criticality", "cve", "internet_exposed", "kev",
                                                     "epss_score", "epss_percentile", "priority", "reason"])
                 rows = list(reader)
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["priority"], "P0")
             self.assertEqual(rows[0]["asset_id"], "server, UK")
             self.assertEqual(rows[0]["cve"], "CVE-2021-44228")
+            self.assertEqual(rows[0]["internet_exposed"], "unknown")
+
+    def test_internet_exposed_accepts_and_retains_three_strings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "findings.csv"
+            for value in ("true", "false", "unknown"):
+                with self.subTest(value=value):
+                    source.write_text(f"asset_id,criticality,cve,internet_exposed\nserver,critical,CVE-2021-44228,{value}\n")
+                    finding = vulnops.load_findings(source)[0]
+                    self.assertEqual(finding["internet_exposed"], value)
+                    self.assertIsInstance(finding["internet_exposed"], str)
+
+    def test_internet_exposed_survives_every_pipeline_stage(self):
+        source = ("asset_id,criticality,cve,internet_exposed\n"
+                  "p2-low,critical,CVE-2099-10001,true\n"
+                  "p1,medium,CVE-2099-10002,false\n"
+                  "p2-missing,low,CVE-2099-10003,false\n"
+                  "p0,critical,CVE-2099-10002,unknown\n"
+                  "p2-high,medium,CVE-2099-10004,unknown\n"
+                  "p2-zero,low,CVE-2099-10005,true\n")
+        expected = {"p2-low": "true", "p1": "false", "p2-missing": "false",
+                    "p0": "unknown", "p2-high": "unknown", "p2-zero": "true"}
+        kev = {"vulnerabilities": [{"cveID": "CVE-2099-10002"}]}
+        epss = {"status": "OK", "status-code": 200, "total": 4, "data": [
+            {"cve": "CVE-2099-10001", "epss": "0.1", "percentile": "0.2"},
+            {"cve": "CVE-2099-10002", "epss": "0.01", "percentile": "0.1"},
+            {"cve": "CVE-2099-10004", "epss": "0.9", "percentile": "0.99"},
+            {"cve": "CVE-2099-10005", "epss": "0", "percentile": "0"},
+        ]}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "data").mkdir()
+            (root / "data" / "findings.csv").write_text(source)
+            responses = [io.BytesIO(json.dumps(feed).encode()) for feed in (kev, epss)]
+            with patch("vulnops.ROOT", root), patch("vulnops.urlopen", side_effect=responses):
+                with patch("vulnops.enrich_with_epss", wraps=vulnops.enrich_with_epss) as enrich:
+                    with patch("vulnops.prioritize", wraps=vulnops.prioritize) as classify:
+                        with patch("vulnops.write_queue", wraps=vulnops.write_queue) as write:
+                            with patch("sys.stdout", new_callable=io.StringIO):
+                                self.assertEqual(vulnops.main(), 0)
+            after_epss = classify.call_args.args[0]
+            # KEV is attached inside prioritize(), rather than a separate enrichment stage.
+            after_classification = vulnops.prioritize(after_epss, {"CVE-2099-10002"})
+            with (root / "output" / "remediation_queue.csv").open(newline="") as output:
+                csv_rows = list(csv.DictReader(output))
+            stages = {
+                "load and KEV retrieval": enrich.call_args.args[0],
+                "EPSS enrichment": after_epss,
+                "KEV enrichment and prioritization": after_classification,
+                "queue ordering": write.call_args.args[1],
+                "CSV output": csv_rows,
+            }
+            for stage, rows in stages.items():
+                for value in ("true", "false", "unknown"):
+                    with self.subTest(stage=stage, internet_exposed=value):
+                        for asset_id, exposure in expected.items():
+                            if exposure == value:
+                                row = next(row for row in rows if row["asset_id"] == asset_id)
+                                self.assertEqual(row["internet_exposed"], value)
+                                self.assertIsInstance(row["internet_exposed"], str)
+            self.assertEqual([row["asset_id"] for row in csv_rows],
+                             ["p0", "p1", "p2-high", "p2-low", "p2-zero", "p2-missing"])
+            self.assertEqual([row["kev"] for row in csv_rows],
+                             ["true", "true", "false", "false", "false", "false"])
+
+    def test_exposure_is_the_only_change_to_v02_csv_output(self):
+        source = ("asset_id,criticality,cve,internet_exposed\n"
+                  "p2-false,critical,CVE-2099-10001,false\n"
+                  "p1,medium,CVE-2099-10002,true\n"
+                  "p2-unknown,critical,CVE-2099-10003,unknown\n"
+                  "p0,critical,CVE-2099-10002,false\n"
+                  "p2-true,critical,CVE-2099-10004,true\n")
+        epss = {cve: {"epss_score": score, "epss_percentile": None} for cve, score in (
+            ("CVE-2099-10001", 0.1), ("CVE-2099-10002", 0.01),
+            ("CVE-2099-10003", 0.4), ("CVE-2099-10004", 0.9),
+        )}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "data").mkdir()
+            input_path = root / "data" / "findings.csv"
+            input_path.write_text(source)
+            findings = vulnops.load_findings(input_path)
+            baseline_findings = [{key: value for key, value in row.items() if key != "internet_exposed"}
+                                 for row in findings]
+            outputs = []
+            for inputs in (baseline_findings, findings):
+                with patch("vulnops.ROOT", root), patch("vulnops.load_findings", return_value=inputs):
+                    with patch("vulnops.load_kev", return_value={"CVE-2099-10002"}):
+                        with patch("vulnops.load_epss", return_value=epss), patch("sys.stdout", new_callable=io.StringIO):
+                            self.assertEqual(vulnops.main(), 0)
+                with (root / "output" / "remediation_queue.csv").open(newline="") as output:
+                    reader = csv.DictReader(output)
+                    self.assertEqual(reader.fieldnames, ["asset_id", "criticality", "cve", "internet_exposed",
+                                                        "kev", "epss_score", "epss_percentile", "priority", "reason"])
+                    outputs.append(list(reader))
+            baseline, rows = outputs
+            self.assertEqual([{key: value for key, value in row.items() if key != "internet_exposed"} for row in rows],
+                             [{key: value for key, value in row.items() if key != "internet_exposed"} for row in baseline])
+            self.assertEqual([row["asset_id"] for row in rows], ["p0", "p1", "p2-true", "p2-unknown", "p2-false"])
+            self.assertEqual([(row["priority"], row["internet_exposed"]) for row in rows], [
+                ("P0", "false"), ("P1", "true"), ("P2", "true"), ("P2", "unknown"), ("P2", "false"),
+            ])
+
+    def test_internet_exposed_rejects_invalid_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "findings.csv"
+            for value in ("yes", "", "maybe", "True", "FALSE", "Unknown"):
+                with self.subTest(value=value):
+                    source.write_text(f"asset_id,criticality,cve,internet_exposed\nserver,critical,CVE-2021-44228,{value}\n")
+                    with self.assertRaisesRegex(ValueError, "internet_exposed"):
+                        vulnops.load_findings(source)
+
+    def test_internet_exposed_column_is_required(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "findings.csv"
+            source.write_text("asset_id,criticality,cve\nserver,critical,CVE-2021-44228\n")
+            with self.assertRaisesRegex(ValueError, "internet_exposed"):
+                vulnops.load_findings(source)
 
     def test_invalid_inputs_are_rejected(self):
         invalid_csvs = [
             "",
-            "asset_id,cve\nserver,CVE-2021-44228\n",
-            "asset_id,criticality,cve,cve\n",
-            "asset_id,criticality,cve,priority\n",
-            "asset_id,criticality,cve,owner\nserver,critical,CVE-2021-44228,Ops\n",
-            "asset_id,criticality,cve\n,critical,CVE-2021-44228\n",
-            "asset_id,criticality,cve\nserver,,CVE-2021-44228\n",
-            "asset_id,criticality,cve\nserver,critical,invalid\n",
-            "asset_id,criticality,cve\nserver,critical\n",
-            "asset_id,criticality,cve\nserver,critical,CVE-2021-44228,extra\n",
+            "asset_id,cve,internet_exposed\nserver,CVE-2021-44228,unknown\n",
+            "asset_id,criticality,cve,cve,internet_exposed\n",
+            "asset_id,criticality,cve,internet_exposed,priority\n",
+            "asset_id,criticality,cve,internet_exposed,owner\nserver,critical,CVE-2021-44228,unknown,Ops\n",
+            "asset_id,criticality,cve,internet_exposed\n,critical,CVE-2021-44228,unknown\n",
+            "asset_id,criticality,cve,internet_exposed\nserver,,CVE-2021-44228,unknown\n",
+            "asset_id,criticality,cve,internet_exposed\nserver,critical,invalid,unknown\n",
+            "asset_id,criticality,cve,internet_exposed\nserver,critical\n",
+            "asset_id,criticality,cve,internet_exposed\nserver,critical,CVE-2021-44228,unknown,extra\n",
         ]
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "findings.csv"
@@ -96,12 +243,12 @@ class VulnOpsTests(unittest.TestCase):
     def test_header_only_input_produces_header_only_output(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "findings.csv"
-            source.write_text("asset_id,criticality,cve\n")
+            source.write_text("asset_id,criticality,cve,internet_exposed\n")
             findings = vulnops.load_findings(source)
             destination = Path(directory) / "queue.csv"
             vulnops.write_queue(destination, vulnops.prioritize(findings, {"CVE-2021-44228"}))
             self.assertEqual(destination.read_text().strip(),
-                             "asset_id,criticality,cve,kev,epss_score,epss_percentile,priority,reason")
+                             "asset_id,criticality,cve,internet_exposed,kev,epss_score,epss_percentile,priority,reason")
 
     def test_kev_feed_is_loaded(self):
         feed = io.BytesIO(b'{"vulnerabilities": [{"cveID": "CVE-2021-44228"}]}')
@@ -294,6 +441,42 @@ class VulnOpsTests(unittest.TestCase):
         for row in rows:
             self.assertEqual(row["reason"], baseline[row["asset_id"]]["reason"])
 
+    def test_internet_exposure_cannot_change_p2_epss_ranking(self):
+        cases = [
+            # Reverse the first input to prove EPSS sorting actually occurs.
+            ([('C', 'unknown', 0.40), ('B', 'true', 0.70), ('A', 'false', 0.90)], ['A', 'B', 'C']),
+            ([('D', 'true', None), ('E', 'false', 0.01)], ['E', 'D']),
+        ]
+        for inputs, expected in cases:
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "data").mkdir()
+                findings = [{"asset_id": asset, "criticality": "critical",
+                             "cve": f"CVE-2099-{1000 + index}", "internet_exposed": exposure}
+                            for index, (asset, exposure, score) in enumerate(inputs)]
+                with (root / "data" / "findings.csv").open("w", newline="") as source:
+                    writer = csv.DictWriter(source, fieldnames=["asset_id", "criticality", "cve", "internet_exposed"])
+                    writer.writeheader()
+                    writer.writerows(findings)
+                epss = {finding["cve"]: {"epss_score": case[2], "epss_percentile": None}
+                        for finding, case in zip(findings, inputs)}
+                with patch("vulnops.ROOT", root), patch("vulnops.load_kev", return_value=set()):
+                    with patch("vulnops.load_epss", return_value=epss):
+                        with patch("sys.stdout", new_callable=io.StringIO):
+                            self.assertEqual(vulnops.main(), 0)
+                with (root / "output" / "remediation_queue.csv").open(newline="") as output:
+                    rows = list(csv.DictReader(output))
+                self.assertEqual([row["asset_id"] for row in rows], expected)
+                self.assertTrue(all(row["priority"] == "P2" for row in rows))
+                by_asset = {row["asset_id"]: row for row in rows}
+                for asset, exposure, score in inputs:
+                    self.assertEqual(by_asset[asset]["internet_exposed"], exposure)
+                    self.assertEqual(by_asset[asset]["epss_score"], "" if score is None else str(score))
+
+    def test_queue_sorting_does_not_reference_internet_exposed(self):
+        # Queue sorting currently lives directly in main().
+        self.assertNotIn("internet_exposed", inspect.getsource(vulnops.main))
+
     def test_p2_missing_epss_sorts_after_numeric_zero_without_changing_values(self):
         scores = {"A": 0.80, "B": None, "C": 0.00, "D": 0.10}
         for assets, expected in (("ABC", ["A", "C", "B"]), ("ABCD", ["A", "D", "C", "B"])):
@@ -324,19 +507,19 @@ class VulnOpsTests(unittest.TestCase):
                 self.assertEqual(csv_by_asset["B"]["epss_score"], "")
 
     def test_main_preserves_v0_classification_and_ranks_only_p2_by_epss(self):
-        source = ("asset_id,criticality,cve\n"
-                  "zero,critical,CVE-2099-10000\n"
-                  "p1,medium,CVE-2021-44228\n"
-                  "missing,critical,CVE-2099-10001\n"
-                  "p0,critical,CVE-2021-44228\n"
-                  "tie-first,low,CVE-2099-10003\n"
-                  "p0-high,critical,CVE-2021-44229\n"
-                  "p1-high,medium,CVE-2021-44229\n"
-                  "tie-second,critical,CVE-2099-10004\n"
-                  "missing-second,low,CVE-2099-10005\n"
-                  "p0-missing,critical,CVE-2021-44230\n"
-                  "p1-missing,medium,CVE-2021-44230\n"
-                  "high-epss,critical,CVE-2099-10002\n")
+        source = ("asset_id,criticality,cve,internet_exposed\n"
+                  "zero,critical,CVE-2099-10000,true\n"
+                  "p1,medium,CVE-2021-44228,false\n"
+                  "missing,critical,CVE-2099-10001,unknown\n"
+                  "p0,critical,CVE-2021-44228,false\n"
+                  "tie-first,low,CVE-2099-10003,false\n"
+                  "p0-high,critical,CVE-2021-44229,true\n"
+                  "p1-high,medium,CVE-2021-44229,true\n"
+                  "tie-second,critical,CVE-2099-10004,true\n"
+                  "missing-second,low,CVE-2099-10005,unknown\n"
+                  "p0-missing,critical,CVE-2021-44230,unknown\n"
+                  "p1-missing,medium,CVE-2021-44230,unknown\n"
+                  "high-epss,critical,CVE-2099-10002,false\n")
         kev_cves = {"CVE-2021-44228", "CVE-2021-44229", "CVE-2021-44230"}
         kev = {"vulnerabilities": [{"cveID": cve} for cve in sorted(kev_cves)]}
         epss = {"status": "OK", "status-code": 200, "total": 6, "data": [
@@ -367,7 +550,7 @@ class VulnOpsTests(unittest.TestCase):
             self.assertEqual(outputs[0], outputs[1])
             with (root / "output" / "remediation_queue.csv").open(newline="") as output:
                 reader = csv.DictReader(output)
-                self.assertEqual(reader.fieldnames, ["asset_id", "criticality", "cve", "kev",
+                self.assertEqual(reader.fieldnames, ["asset_id", "criticality", "cve", "internet_exposed", "kev",
                                                     "epss_score", "epss_percentile", "priority", "reason"])
                 rows = list(reader)
             baseline_by_asset = {row["asset_id"]: row for row in baseline}
@@ -392,7 +575,7 @@ class VulnOpsTests(unittest.TestCase):
             root = Path(directory)
             (root / "data").mkdir()
             (root / "output").mkdir()
-            (root / "data" / "findings.csv").write_text("asset_id,criticality,cve\nserver,critical,CVE-2021-44228\n")
+            (root / "data" / "findings.csv").write_text("asset_id,criticality,cve,internet_exposed\nserver,critical,CVE-2021-44228,unknown\n")
             queue = root / "output" / "remediation_queue.csv"
             queue.write_text("previous output\n")
             for failure in (URLError("simulated outage"), io.BytesIO(b"invalid json")):
@@ -409,7 +592,7 @@ class VulnOpsTests(unittest.TestCase):
             root = Path(directory)
             (root / "data").mkdir()
             (root / "output").mkdir()
-            (root / "data" / "findings.csv").write_text("asset_id,criticality,cve\nserver,critical,CVE-2021-44228\n")
+            (root / "data" / "findings.csv").write_text("asset_id,criticality,cve,internet_exposed\nserver,critical,CVE-2021-44228,unknown\n")
             queue = root / "output" / "remediation_queue.csv"
             queue.write_text("previous output\n")
             with patch("vulnops.ROOT", root), patch("vulnops.urlopen", side_effect=URLError("download failed")):

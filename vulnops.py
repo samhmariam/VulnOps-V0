@@ -12,7 +12,7 @@ from urllib.request import urlopen
 ROOT = Path(__file__).resolve().parent
 KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 EPSS_URL = "https://api.first.org/data/v1/epss"
-REQUIRED_COLUMNS = ("asset_id", "criticality", "cve")
+REQUIRED_COLUMNS = ("asset_id", "criticality", "cve", "internet_exposed")
 RESULT_COLUMNS = ("kev", "epss_score", "epss_percentile", "priority", "reason")
 
 
@@ -20,8 +20,8 @@ def load_findings(path):
     with path.open(newline="", encoding="utf-8-sig") as source:
         reader = csv.DictReader(source)
         columns = reader.fieldnames
-        if not columns or len(columns) != 3 or set(columns) != set(REQUIRED_COLUMNS):
-            raise ValueError("Findings CSV must contain exactly asset_id, criticality, and cve columns.")
+        if not columns or len(columns) != len(REQUIRED_COLUMNS) or set(columns) != set(REQUIRED_COLUMNS):
+            raise ValueError("Findings CSV must contain exactly asset_id, criticality, cve, and internet_exposed columns.")
         findings = []
         for row in reader:
             if None in row or any(value is None for value in row.values()):
@@ -32,6 +32,8 @@ def load_findings(path):
                     raise ValueError(f"CSV record ending at line {reader.line_num} has an empty {column}.")
             row["cve"] = row["cve"].upper()
             row["criticality"] = row["criticality"].lower()
+            if row["internet_exposed"] not in ("true", "false", "unknown"):
+                raise ValueError(f"CSV record ending at line {reader.line_num} has invalid internet_exposed; expected true, false, or unknown.")
             if not re.fullmatch(r"CVE-[0-9]{4}-[0-9]{4,}", row["cve"]):
                 raise ValueError(f"CSV record ending at line {reader.line_num} has an invalid CVE: {row['cve']}.")
             findings.append(row)
